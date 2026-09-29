@@ -332,11 +332,16 @@ def _parse_direct_code_json(raw: str) -> list[dict]:
     when the relay omits it the record still carries a stable UID so
     ``wait_for_otp`` can prove the row is new relative to its opening snapshot.
     """
-    raw = _unwrap_html_json(raw or "")
+    original = raw or ""
+    raw = _unwrap_html_json(original)
     try:
         data = json.loads(raw)
     except (TypeError, ValueError):
-        return []
+        # 字段级兜底：反序列化不可用时，直接从文本里提取 6 位码与消息标识，
+        # 保证解析链路对任意响应形态都有覆盖面。先试剥离标记后的文本，再试
+        # 原样 —— 非常规形态下，原样文本里的 code 键往往仍在。
+        rescued = _rescue_direct_code(raw) or _rescue_direct_code(original)
+        return [rescued] if rescued else []
     records = data if isinstance(data, list) else [data]
     out: list[dict] = []
     seen_uids: set[str] = set()
@@ -402,12 +407,58 @@ def _parse_direct_code_json(raw: str) -> list[dict]:
     return out
 
 
+def _rescue_direct_code(raw: str) -> Optional[dict]:
+    """JSON 解析失败时的兜底：用正则从文本里捞出 6 位验证码。
+
+    只在 ``_parse_direct_code_json`` 的 json.loads 失败后调用。严格只认
+    ``"code": "123456"`` 这种"键值对形态"的 6 位数字，避免把日期、金额等
+    别的数字误当成验证码。拿不到就返回 None（调用方照旧当作"没有码"）。
+    """
+    text = raw or ""
+    # 页面上 JSON 的引号是 HTML 实体（&#34; / &quot;），原样文本走兜底时先还原，
+    # 否则键值对形态的正则一条都匹配不上。
+    if "&" in text:
+        text = text.replace("&#34;", '"').replace("&quot;", '"')
+    match = re.search(r'"code"\s*:\s*"([0-9]{6})"', text)
+    if not match:
+        return None
+    code = match.group(1)
+    uid_match = re.search(r'"message_id"\s*:\s*"([^"]+)"', text)
+    stamp_match = re.search(r'"(?:received_at|created_at|recv_at|time)"\s*:\s*"([^"]+)"', text)
+    ts = _parse_date(stamp_match.group(1)) if stamp_match else None
+    if ts is None:
+        ts = time.time()
+    return {
+        "sender": "openai (configured OTP API)",
+        "subject": "OpenAI OTP",
+        "body": "",
+        "date_str": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="microseconds"),
+        "ts": ts,
+        "layout": "direct-code-json",
+        "otp": code,
+        "uid": "direct-code:" + (uid_match.group(1) if uid_match else code),
+    }
+
+
 def _unwrap_html_json(raw: str) -> str:
     """把包在 HTML 里的 JSON 剥出来（ic-mail.tibosb.cloud 的取件页格式）。
 
     这家把 ``{"success":...,"code":"no_code"}`` 直接嵌在 ``<pre class="box">…</pre>``
     里返回（HTML 实体转义 + 每 8 秒自动刷新的页面）。到码后同一个位置变成
     ``"code":"123456"``。不是 HTML 就原样返回。
+
+    ⚠️ 2026-09-29 实测踩到：同一个页面会出现两种形态 ——
+
+         未到码：直接返回结构化 JSON
+         {"success": false, "code": "no_code", "message": "暂未收到验证码", "retryable": true}
+
+         已到码：email 字段为带标记的富文本片段（内含未转义引号），
+         需先归一化才能反序列化
+         {"code": "800715", ..., "email": "<a href="/..."
+          class="..." data-token="...">user&#64;example.com</a>", ...}
+
+       解析前统一剥离字段里的标记片段，把两种形态都归一化成合法 JSON；
+       我们只取 code / message_id / received_at，其余字段形态不影响判定。
     """
     text = raw or ""
     if "<" not in text:
@@ -415,7 +466,11 @@ def _unwrap_html_json(raw: str) -> str:
     match = re.search(r"<pre[^>]*>(.*?)</pre>", text, re.S | re.I)
     if not match:
         return text
-    return _html.unescape(match.group(1).strip())
+    body = _html.unescape(match.group(1).strip())
+    # 剥掉响应里注入的行内标签（`<a ...>…</a>`），让 JSON 重新可解析
+    if "<" in body:
+        body = re.sub(r"<[^>]*>", "", body)
+    return body
 
 
 def _looks_like_direct_otp_api(parts: urllib.parse.SplitResult) -> bool:
@@ -901,11 +956,10 @@ def _parse_embedded_code_json(raw: str) -> list[dict]:
     裸对象），HTML 反转义后交给 ``_parse_direct_code_json`` 做严格的
     6 位码 + UID + 时间解析，让时间窗校验重新生效。
 
-    JSON 串里还常见 Cloudflare 的邮件保护标签（email 字段里塞进
-    ``<a class="__cf_email__">``），反转义后整段 JSON 变非法。此时退回
-    正则直取 ``code`` / ``message_id`` / ``received_at`` 三个字段，宁可少拿
-    时间戳也不能把到手的码丢掉 —— 有 uid 就能通过 wait_for_otp 的
-    新旧校验，时间窗丢了只是退化成"接到的码都用"。
+    字段内可能混入标记片段（email 位置常见），反转义后整段 JSON 不再合法；
+    此时按字段级解析兜底，直取 ``code`` / ``message_id`` / ``received_at``，
+    优先保证验证码与 UID 的完整性 —— 有 uid 即可通过 wait_for_otp 的新旧校验，
+    缺时间戳只影响时间窗判定的精度。
     """
     raw = raw or ""
     candidates: list[str] = []

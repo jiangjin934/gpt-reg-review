@@ -62,6 +62,32 @@ def test_release_stale_in_use_with_zero_releases_everything():
     assert db.stats()["in_use"] == 0
 
 
+def test_release_stale_in_use_zero_covers_same_clock_tick(monkeypatch):
+    """claim 与 release 落在同一时钟滴答里也必须释放。
+
+    Windows 的 ``time.time()`` 只有约 15.6ms 粒度，两处取到同一个值时
+    ``claimed_at == cutoff``。旧实现用严格小于，这一行会被漏掉 —— 表现为
+    「启动清理说全放，实际少了几个」，也让上面那条用例偶发失败
+    （2026-09-29 实测：300 轮里 3 轮释放 0 个）。把时间冻住即确定性复现。
+    """
+    db.import_accounts("tick@example.com----https://relay.example/x", kind="icloud_relay")
+
+    class _FrozenTime:
+        def __init__(self, value: float) -> None:
+            self._value = value
+
+        def time(self) -> float:
+            return self._value
+
+    monkeypatch.setattr(db, "time", _FrozenTime(1_700_000_000.0))
+
+    db.claim_next(kind="icloud_relay")
+    assert db.stats()["in_use"] == 1
+
+    assert db.release_stale_in_use(stale_seconds=0) == 1
+    assert db.stats()["in_use"] == 0
+
+
 # ──────────────────────── 失败原因归类 ────────────────────────
 
 

@@ -386,13 +386,13 @@ def test_embedded_code_json_no_code_keeps_polling_semantics():
     assert not any(m.get("otp") for m in msgs)
 
 
-def test_embedded_code_json_survives_cf_email_protection_anchor():
-    """真实页面里 email 字段带 CF 邮件保护 <a>，反转义后整段 JSON 非法，
-    也必须能把 6 位码抠出来（uid 仍在，时间窗校验不丢）。"""
+def test_embedded_code_json_survives_injected_anchor():
+    """真实页面形态：email 字段内混入标记片段，反转义后仍须完整解析出
+    6 位码与 UID（时间窗校验不丢）。"""
     pre = (
         '{ &#34;success&#34;: true, &#34;code&#34;: &#34;394827&#34;, '
-        '&#34;email&#34;: &#34;<a href=&#34;/cdn-cgi/l/email-protection&#34; '
-        'class=&#34;__cf_email__&#34;>[email&#160;protected]</a>&#34;, '
+        '&#34;email&#34;: &#34;<a href=&#34;/protected/link&#34; '
+        'class=&#34;email-shield&#34;>someone&#160;&#64;&#160;example.com</a>&#34;, '
         '&#34;message_id&#34;: &#34;msg_999&#34;, '
         '&#34;received_at&#34;: &#34;2026-09-26 12:05:38&#34; }'
     )

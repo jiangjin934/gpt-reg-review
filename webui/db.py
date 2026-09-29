@@ -594,13 +594,18 @@ def release_stale_in_use(stale_seconds: float = 1800) -> int:
     """把 claimed_at 超过 N 秒还在 in_use 的号释放回 available。
 
     场景：上次 webui 强退/进程崩溃，号卡在 in_use 永远不释放。默认 30 分钟。
+
+    边界用 ``<=`` 而不是 ``<``：Windows 上 ``time.time()`` 只有约 15.6ms 粒度，
+    claim 与 release 落在**同一滴答**时 ``claimed_at == cutoff``，严格小于会把这
+    一行漏掉 —— ``stale_seconds=0``（启动清理）本该"全部释放"却偶尔少放几个。
+    2026-09-29 实测复现：300 轮里有 3 轮释放 0 个。
     """
     with _lock:
         con = _conn()
         cutoff = time.time() - stale_seconds
         rc = con.execute(
             "UPDATE outlook_accounts SET status='available', claimed_at=NULL "
-            "WHERE status='in_use' AND (claimed_at IS NULL OR claimed_at < ?)",
+            "WHERE status='in_use' AND (claimed_at IS NULL OR claimed_at <= ?)",
             (cutoff,),
         )
         con.commit()
