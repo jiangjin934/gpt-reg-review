@@ -25,6 +25,8 @@
 ### 任意平台
 
 ```bash
+git clone https://github.com/jiangjin934/gpt-reg-review.git
+cd gpt-reg-review
 pip install -r requirements.txt
 python -m camoufox fetch        # 可选：只在用浏览器引擎时需要
 python -m playwright install chromium   # 可选：同上
