@@ -1,0 +1,5014 @@
+"""
+注册/登录流程 - 协议直连方式
+完整链路:
+  chatgpt_csrf -> chatgpt_signin_openai -> auth_oauth_init -> sentinel
+  -> signup -> send_otp -> verify_otp -> create_account
+  -> redirect_chain -> auth_session -> (optional) oauth_token_exchange
+"""
+import json
+import base64
+import hashlib
+import hmac
+import logging
+import os
+import random
+import re
+import secrets
+import struct
+import subprocess
+import time
+import uuid
+from datetime import datetime
+from typing import Optional, Any
+from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
+
+from config import Config
+from fingerprint import (
+    diagnose_fingerprint,
+    device_silhouette,
+    generate_fingerprint,
+    header_profile,
+    ua_for_impersonate,
+    fingerprint_for_impersonate,
+    validate_fingerprint,
+)
+from mail_providers import MailProvider
+from http_client import create_http_session, USER_AGENT
+from webui.environment import compare_exit_observation
+from webui.probes import redact_probe_error
+
+logger = logging.getLogger(__name__)
+
+
+class NetworkPreflightError(RuntimeError):
+    """Network validation failed before any authentication side effects."""
+
+
+class PasswordRequiredError(RuntimeError):
+    """Registration must stop when a usable password has not been established."""
+
+
+class IdentityVerificationRequired(RuntimeError):
+    """OpenAI 要求该账号完成 Persona 身份验证（政府证件），协议无法代答。
+
+    出现条件是 create_account 响应 page.type=identity_verification 且带
+    persona_inquiry。该页面真实协议只有两条：
+      POST /api/accounts/get_inquiry_status      -> {status}
+      POST /api/accounts/complete_id_verification
+    status 为 approved 时才能由 complete_id_verification 推进；其余状态
+    （needs_review / declined / 待上传）只有真人上传证件才能继续。
+    对这种号唯一正确的处理是终止并隔离，而不是重发 OTP 重试——重试风暴
+    正是把号推进身份验证风控的原因。
+    """
+
+    def __init__(self, status: str = "", inquiry_id: str = ""):
+        self.status = (status or "").strip()
+        self.inquiry_id = (inquiry_id or "").strip()
+        detail = f"status={self.status}" if self.status else "status=required"
+        if self.inquiry_id:
+            detail += f" inquiry={self.inquiry_id[:16]}"
+        super().__init__(f"OpenAI 要求身份验证(Persona): {detail}")
+
+
+def _looks_like_email_verify_url(url: str) -> bool:
+    """auth.openai.com 的邮箱 OTP 验证页（/email-verification）。
+
+    注意：/verify-your-identity 不是邮箱验证页，而是 Persona 证件身份验证
+    （identity_verification），协议完全不同，见 IdentityVerificationRequired。
+    """
+    if not url:
+        return False
+    return "/email-verification" in url
+
+
+def _looks_like_identity_verification_url(url: str) -> bool:
+    """auth.openai.com 的 Persona 身份验证页（/verify-your-identity）。"""
+    if not url:
+        return False
+    return "/verify-your-identity" in url
+
+
+# ── RFC 6238 TOTP 实现（用于 mfa-challenge 计算动态码）────────────
+def _hotp(secret_b32: str, counter: int, digits: int = 6) -> str:
+    """HOTP 算法（RFC 4226）"""
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8))
+    msg = struct.pack(">Q", counter)
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    code = (struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
+def _totp_now(secret_b32: str) -> str:
+    """当前 30 秒窗口的 6 位 TOTP 码"""
+    return _hotp(secret_b32, int(time.time()) // 30)
+
+
+class AuthResult:
+    """认证结果"""
+
+    def __init__(self):
+        self.email: str = ""
+        self.password: str = ""
+        self.session_token: str = ""
+        self.access_token: str = ""
+        self.device_id: str = ""
+        self.csrf_token: str = ""
+        self.id_token: str = ""
+        self.refresh_token: str = ""
+        self.cookie_header: str = ""
+        self.totp_secret: str = ""
+
+    def is_valid(self) -> bool:
+        return bool(self.session_token and self.access_token)
+
+    def to_dict(self) -> dict:
+        return {
+            "email": self.email,
+            "password": self.password,
+            "session_token": self.session_token,
+            "access_token": self.access_token,
+            "device_id": self.device_id,
+            "csrf_token": self.csrf_token,
+            "id_token": self.id_token,
+            "refresh_token": self.refresh_token,
+            "cookie_header": self.cookie_header,
+            "totp_secret": self.totp_secret,
+        }
+
+
+class AuthFlow:
+    """注册/登录协议流"""
+
+    def __init__(
+        self,
+        config: Config,
+        sms_callback: Optional[Any] = None,
+        env_overrides: Optional[dict] = None,
+        on_password: Optional[Any] = None,
+        on_session_ready: Optional[Any] = None,
+        account_callback: Optional[Any] = None,
+        fingerprint_country: str = "",
+        fingerprint: Optional[dict] = None,
+        fingerprint_browser_family: str = "auto",
+        fingerprint_weighted: bool = True,
+        environment: Optional[dict] = None,
+        environment_observer: Optional[Any] = None,
+        environment_rebind: Optional[Any] = None,
+    ):
+        # 本次流程专属的配置覆盖（WEBUI_ALLOW_LOGIN / OTP_TIMEOUT / OAuth 开关等）。
+        # ⚠️ 以前 registrar 是直接写 os.environ 再在 finally 里还原的，
+        #    但 auto_loop 会并发跑多个 worker —— A 写的 OTP_TIMEOUT 会被 B 看见，
+        #    B 跑完还原成 A 之前的值，A 后半程就读到别人的配置了。
+        #    现在覆盖值只挂在实例上，进程全局环境一个字节都不动。
+        self._env_overrides = dict(env_overrides or {})
+        self.config = config
+        self._environment = dict(environment or {})
+        self._environment_observer = environment_observer
+        # 预检阶段出口漂移的自愈钩子（由 WebUI 层接线到持久层）。CLI 单独跑时为空，
+        # 行为与以前完全一致：漂移即中止。
+        self._environment_rebind = environment_rebind
+        self._browser_family = (fingerprint_browser_family or "auto").strip().lower()
+        self._country_code = (fingerprint_country or "").strip().upper()
+        if fingerprint is not None:
+            validate_fingerprint(fingerprint)
+            if (
+                self._browser_family not in ("", "auto", "random")
+                and fingerprint.get("browser_family") != self._browser_family
+            ):
+                raise ValueError("fingerprint does not match fingerprint_browser_family")
+            if self._country_code and self._country_code != str(
+                fingerprint.get("country_code", "")
+            ).upper():
+                raise ValueError("fingerprint country does not match fingerprint_country")
+            self._fingerprint = fingerprint
+        else:
+            if not self._country_code:
+                self._country_code = self._probe_country_before_fingerprint()
+            self._fingerprint = generate_fingerprint(
+                country_code=self._country_code,
+                browser_family=self._browser_family,
+                weighted=fingerprint_weighted,
+            )
+        validate_fingerprint(self._fingerprint)
+        self._country_code = str(self._fingerprint.get("country_code", self._country_code)).upper()
+        self._ua = self._fingerprint["user_agent"]
+        self._impersonate_candidates = self._fingerprint.get(
+            "fallback_impersonates",
+            [self._fingerprint["impersonate"], "safari17_0", "safari15_5"],
+        )
+        self._impersonate_idx = 0
+        self.session = create_http_session(
+            proxy=config.proxy,
+            impersonate=self._impersonate_candidates[self._impersonate_idx],
+            user_agent=self._ua,
+        )
+        self.result = AuthResult()
+        # 可选 SMS 接码控制器（sms_provider.PhoneCallbackController 实例）
+        # 命中 add-phone 时自动租手机号 + 接 SMS 验证码，否则回退到环境变量路径
+        self._sms_callback = sms_callback
+        # 密码一在 OpenAI 侧生效就回调出去，调用方负责立刻落盘。
+        # 签名 (email: str, password: str) -> None，异常由 register_password 吞掉。
+        # ⚠️ 协议层不认识 webui.db，所以只给回调，"存哪"留给调用方决定，
+        #    auth_flow 单独当 CLI 用时不传就是了，行为和以前一模一样。
+        self._on_password = on_password
+        # 拿到 session（access_token）之后、Codex 授权之前的钩子。
+        # 签名 (flow: AuthFlow, access_token: str) -> None，异常由调用点吞掉。
+        # 为的是把 2FA 绑定插进主人指定的顺序：
+        #     创建账户 → 重定向链 → 拿 session → ★绑 2FA★ → Codex 授权 → 接码
+        # ⚠️ 传了这个钩子会**顺带关掉** run_register 里 callback 前那次 Codex 抢跑
+        #    （:3051 OAUTH_CODEX_RT_BEFORE_CALLBACK），否则 Codex 会跑在钩子前面，
+        #    顺序就白调了。不传则一个字节都不变，老行为。
+        self._on_session_ready = on_session_ready
+        # 账号凭证回调：已有账号登录时从数据库加载密码和 totp_secret。
+        # 签名 (email: str) -> dict，返回 {"password": "...", "totp_secret": "..."}。
+        # 用于 mfa-challenge 路径：密码验证后需要 TOTP 码，从库里读 secret。
+        self._account_callback = account_callback
+        self._http_trace_enabled = str(os.getenv("AUTH_HTTP_TRACE", "0")).lower() in ("1", "true", "yes", "on")
+        # signup() 会在分支里 set；run_protocol_login 命中已有账号路径会跳过 signup，
+        # 导致 kickoff_otp_delivery 读未初始化属性 AttributeError。这里给个默认值。
+        self._is_existing_account = False
+        self._existing_email_verification_mode = ""
+        self._existing_page_type = ""
+        self._manual_login_verifier = (os.getenv("LOGIN_VERIFIER", "") or "").strip()
+        self._captured_login_verifier = ""
+        self._oauth_client_secret = (os.getenv("OAUTH_CLIENT_SECRET", "") or "").strip()
+        self._oauth_client_id = "YOUR_OPENAI_WEB_CLIENT_ID"
+        self._oauth_redirect_uri = "https://chatgpt.com/api/auth/callback/openai"
+        self._oauth_scope = ""
+        self._oauth_state = ""
+        self._oauth_auth_url = ""
+        self._client_auth_session_dump: dict[str, Any] = {}
+        self._client_auth_session_id: str = ""
+        self._dump_login_verifier: str = ""
+        self._codex_rt_attempted: bool = False
+        # Safe, structured reason for the most recent Codex OAuth failure.
+        # Values contain only status/field names/URL paths; never token or
+        # cookie contents.  The WebUI probe uses this when the method returns
+        # False, so a missing refresh token has an actionable cause.
+        self._oauth_failure_reason = ""
+        self._oauth_failure_details: dict[str, Any] = {}
+        self._trace_dump_enabled = str(os.getenv("AUTH_TRACE_DUMP", "0")).lower() in ("1", "true", "yes", "on")
+        self._trace_include_cookie = str(os.getenv("AUTH_TRACE_INCLUDE_COOKIE", "0")).lower() in (
+            "1", "true", "yes", "on"
+        )
+        self._trace_dump_path = ""
+        if self._trace_dump_enabled:
+            try:
+                os.makedirs("outputs", exist_ok=True)
+                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                self._trace_dump_path = os.path.join(
+                    "outputs", f"auth_trace_{ts}_{os.getpid()}.jsonl"
+                )
+                logger.info(f"HTTP 明文抓包已启用: {self._trace_dump_path}")
+            except Exception as e:
+                logger.warning(f"初始化 HTTP 抓包文件失败: {e}")
+                self._trace_dump_enabled = False
+        logger.debug(
+            f"指纹: id={self._fingerprint['fingerprint_id']} "
+            f"impersonate={self._fingerprint['impersonate']} "
+            f"screen={self._fingerprint['screen']} lang={self._fingerprint['lang']} "
+            f"ua={self._ua}"
+        )
+
+    def _probe_country_before_fingerprint(self) -> str:
+        """Best-effort proxy country probe before freezing the task profile."""
+        proxy = (getattr(self.config, "proxy", None) or "").strip()
+        if not proxy:
+            return ""
+        session = None
+        try:
+            # Keep the bootstrap probe on the same explicit client path as the
+            # task session.  A requests probe can consult HTTP(S)_PROXY and can
+            # resolve SOCKS hosts locally, producing a country that does not
+            # describe the session used for registration.
+            session = create_http_session(
+                proxy=proxy,
+                impersonate="chrome110",
+            )
+            resp = session.get(
+                "https://cloudflare.com/cdn-cgi/trace",
+                timeout=10,
+            )
+            if resp.ok:
+                for line in resp.text.splitlines():
+                    if line.startswith("loc="):
+                        code = line.split("=", 1)[1].strip().upper()
+                        logger.info("启动前代理国家探测: %s", code)
+                        return code
+        except Exception as exc:
+            logger.debug("启动前代理国家探测失败: %s", exc)
+        finally:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+        return ""
+
+    def _build_chatgpt_cookie_header(self) -> str:
+        """
+        导出当前会话中的 chatgpt.com 相关 cookie。
+
+        说明：
+        - `/backend-api/payments/checkout` 的 modern/custom 入口不仅依赖
+          `__Secure-next-auth.session-token`，还会校验若干同域 cookie
+          （如 csrf / oai-sc / Cloudflare 相关 cookie 等）。
+        - 因此这里不能只回传 session_token，需要尽量保留当前会话里已经拿到的
+          `chatgpt.com` 域 cookie 集合。
+        """
+        cookie_pairs: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        try:
+            jar_iter = list(self.session.cookies)
+        except Exception:
+            jar_iter = []
+
+        for cookie in jar_iter:
+            try:
+                name = (getattr(cookie, "name", "") or "").strip()
+                value = getattr(cookie, "value", "") or ""
+                domain = (getattr(cookie, "domain", "") or "").strip().lower()
+            except Exception:
+                continue
+            if not name or not value:
+                continue
+            if domain and "chatgpt.com" not in domain:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            cookie_pairs.append((name, value))
+
+        # 兜底补齐关键 cookie，避免某些 cookiejar 迭代行为差异导致遗漏
+        critical_names = [
+            "__Secure-next-auth.session-token",
+            "__Host-next-auth.csrf-token",
+            "__Secure-next-auth.callback-url",
+            "oai-did",
+            "oai-sc",
+            "cf_clearance",
+            "__cf_bm",
+            "_cfuvid",
+            "__cflb",
+            "__stripe_mid",
+            "__stripe_sid",
+            "oai-client-auth-info",
+            "oai-gn",
+            "oai-nav-state",
+            "oai-hlib",
+            "_account_is_fedramp",
+            "oai_consent_analytics",
+            "oai_consent_marketing",
+            "oai-allow-ne",
+            "_ga",
+            "_ga_9SHBSK2D9J",
+            "_gcl_au",
+            "_fbp",
+            "_puid",
+            "_dd_s",
+            "g_state",
+        ]
+        for name in critical_names:
+            if name in seen:
+                continue
+            try:
+                value = self.session.cookies.get(name, "")
+            except Exception:
+                value = ""
+            if value:
+                seen.add(name)
+                cookie_pairs.append((name, value))
+
+        return "; ".join(f"{name}={value}" for name, value in cookie_pairs if name and value)
+
+    def _trace_http(self, step: str, resp, extra_request: dict | None = None):
+        """可选 HTTP 细粒度追踪（用于协议调试）"""
+        if (not self._http_trace_enabled and not self._trace_dump_enabled) or resp is None:
+            return
+        try:
+            req = getattr(resp, "request", None)
+            method = getattr(req, "method", "") if req else ""
+            req_url = getattr(req, "url", "") if req else ""
+            req_body = ""
+            req_headers = {}
+            if req is not None:
+                raw_req_body = getattr(req, "body", None)
+                if raw_req_body is None:
+                    raw_req_body = getattr(req, "content", None)
+                if raw_req_body is None:
+                    raw_req_body = getattr(req, "data", None)
+                if isinstance(raw_req_body, bytes):
+                    req_body = raw_req_body.decode("utf-8", errors="replace")
+                elif raw_req_body is not None:
+                    req_body = str(raw_req_body)
+                try:
+                    req_headers = dict(getattr(req, "headers", {}) or {})
+                except Exception:
+                    req_headers = {}
+
+            # 手动补充请求信息（curl_cffi 某些场景 request.body/headers 为空）
+            if isinstance(extra_request, dict):
+                if not method:
+                    method = str(extra_request.get("method", "") or "")
+                if not req_url:
+                    req_url = str(extra_request.get("url", "") or "")
+                if not req_body:
+                    maybe_body = extra_request.get("body", "")
+                    if isinstance(maybe_body, bytes):
+                        req_body = maybe_body.decode("utf-8", errors="replace")
+                    else:
+                        req_body = str(maybe_body or "")
+                extra_headers = extra_request.get("headers", {})
+                if isinstance(extra_headers, dict):
+                    merged = dict(req_headers or {})
+                    merged.update(extra_headers)
+                    req_headers = merged
+
+            status = getattr(resp, "status_code", "N/A")
+            final_url = str(getattr(resp, "url", "") or "")
+            req_cookie = (req_headers.get("Cookie", "") or "")
+            location = (resp.headers.get("Location", "") or "")[:180]
+            req_id = (resp.headers.get("x-request-id", "") or "")[:120]
+            ctype = (resp.headers.get("Content-Type", "") or "")[:120]
+            # 尽量保留完整 Set-Cookie（某些关键 cookie 可能在后续片段）
+            set_cookie_list: list[str] = []
+            try:
+                get_list = getattr(resp.headers, "get_list", None) or getattr(resp.headers, "getlist", None)
+                if callable(get_list):
+                    vals = get_list("Set-Cookie")
+                    if isinstance(vals, list):
+                        set_cookie_list = [str(x) for x in vals if x]
+            except Exception:
+                set_cookie_list = []
+            if not set_cookie_list:
+                one = (resp.headers.get("Set-Cookie", "") or "")
+                if one:
+                    set_cookie_list = [one]
+            set_cookie_raw = " || ".join(set_cookie_list)
+            set_cookie = set_cookie_raw[:260]
+            body = (resp.text or "").replace("\n", " ").replace("\r", " ")
+            body = body[:260]
+            req_headers_lc = {(str(k).lower()): v for k, v in (req_headers or {}).items()}
+
+            if self._http_trace_enabled:
+                logger.info(
+                    "[HTTP TRACE] %s | %s %s -> %s | url=%s | location=%s | req_id=%s | ctype=%s | set_cookie=%s | body=%s",
+                    step,
+                    method,
+                    req_url[:180],
+                    status,
+                    final_url[:180],
+                    location,
+                    req_id,
+                    ctype,
+                    set_cookie,
+                    body,
+                )
+                if self._trace_include_cookie and req_cookie:
+                    logger.info("[HTTP TRACE] %s | req_cookie=%s", step, req_cookie[:360])
+
+            # 从多处信息中抓取 login_verifier/code_verifier
+            self._sniff_login_verifier(req_url, f"{step}:req_url")
+            self._sniff_login_verifier(req_body, f"{step}:req_body")
+            self._sniff_login_verifier(final_url, f"{step}:final_url")
+            self._sniff_login_verifier(location, f"{step}:location")
+            raw_text = resp.text or ""
+            self._sniff_login_verifier(raw_text, f"{step}:resp_body")
+
+            # 明文 HTTP 抓包落盘（jsonl）
+            if self._trace_dump_enabled and self._trace_dump_path:
+                try:
+                    include_req_cookie = self._env_flag("AUTH_TRACE_INCLUDE_REQ_COOKIE", "0")
+                    record = {
+                        "ts": datetime.utcnow().isoformat() + "Z",
+                        "step": step,
+                        "request": {
+                            "method": method,
+                            "url": req_url,
+                            "body": req_body[:120000],
+                            "headers": {
+                                "Content-Type": (req_headers_lc.get("content-type", "") or "")[:240],
+                                "Accept": (req_headers_lc.get("accept", "") or "")[:240],
+                                "Referer": (req_headers_lc.get("referer", "") or "")[:500],
+                                "Origin": (req_headers_lc.get("origin", "") or "")[:120],
+                                **(
+                                    {
+                                        "Cookie": (req_headers_lc.get("cookie", "") or "")[:6000],
+                                    }
+                                    if include_req_cookie
+                                    else {}
+                                ),
+                            },
+                        },
+                        "response": {
+                            "status_code": status,
+                            "url": final_url,
+                            "location": resp.headers.get("Location", ""),
+                            "x_request_id": resp.headers.get("x-request-id", ""),
+                            "content_type": resp.headers.get("Content-Type", ""),
+                            "set_cookie": set_cookie_raw,
+                            "set_cookie_list": set_cookie_list,
+                            "body": raw_text[:120000],
+                        },
+                        "captured_login_verifier": self._captured_login_verifier,
+                    }
+                    if self._trace_include_cookie and req_cookie:
+                        record["request"]["headers"]["Cookie"] = req_cookie[:8000]
+                    with open(self._trace_dump_path, "a", encoding="utf-8") as fw:
+                        fw.write(json.dumps(record, ensure_ascii=False) + "\n")
+                except Exception as e:
+                    logger.debug(f"HTTP 抓包写入失败: {e}")
+        except Exception as e:
+            logger.debug(f"HTTP trace 输出失败: {e}")
+
+    def _sniff_login_verifier(self, text: str, source: str = ""):
+        """从任意文本中提取 login_verifier/code_verifier。"""
+        if not text:
+            return
+        try:
+            patterns = [
+                r"(?:login_verifier|code_verifier|verifier)=([A-Za-z0-9._~-]{8,})",
+                r'"(?:login_verifier|code_verifier|verifier)"\s*:\s*"([^"]{8,})"',
+            ]
+            for p in patterns:
+                m = re.search(p, text)
+                if not m:
+                    continue
+                v = (m.group(1) or "").strip()
+                if not v:
+                    continue
+                if v != self._captured_login_verifier:
+                    self._captured_login_verifier = v
+                    logger.info("捕获 login_verifier 来源=%s len=%s", source or "unknown", len(v))
+                return
+        except Exception:
+            return
+
+    @staticmethod
+    def _walk_collect_str_fields(obj: Any, wanted_keys: set[str], out: dict[str, str], depth: int = 0, max_depth: int = 6):
+        """递归收集目标字段（仅字符串值）。"""
+        if depth > max_depth or obj is None:
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                kk = (str(k) or "").strip().lower()
+                if kk in wanted_keys and isinstance(v, str) and v.strip():
+                    out[kk] = v.strip()
+                AuthFlow._walk_collect_str_fields(v, wanted_keys, out, depth + 1, max_depth)
+        elif isinstance(obj, list):
+            for it in obj:
+                AuthFlow._walk_collect_str_fields(it, wanted_keys, out, depth + 1, max_depth)
+
+    def fetch_client_auth_session_dump(self, stage: str = "") -> dict:
+        """
+        尝试读取 auth.openai 的 client_auth_session_dump：
+        - 可能包含 session_id / client_auth_session 的额外状态
+        - 若出现 verifier/refresh 相关字段，自动注入当前流程
+        """
+        headers = self._common_headers("https://auth.openai.com/email-verification")
+        headers["Accept"] = "application/json"
+        try:
+            resp = self.session.get(
+                "https://auth.openai.com/api/accounts/client_auth_session_dump",
+                headers=headers,
+                timeout=30,
+            )
+            self._trace_http(f"client_auth_session_dump_{stage or 'default'}", resp)
+        except Exception as e:
+            logger.debug(f"client_auth_session_dump 请求异常({stage}): {e}")
+            return {}
+
+        if resp.status_code != 200:
+            logger.info(
+                "client_auth_session_dump(%s) 非 200: %s",
+                stage or "default",
+                resp.status_code,
+            )
+            return {}
+
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning(f"client_auth_session_dump({stage}) JSON 解析失败")
+            return {}
+
+        if not isinstance(data, dict):
+            return {}
+
+        self._client_auth_session_dump = data
+        cas = data.get("client_auth_session", {}) if isinstance(data.get("client_auth_session"), dict) else {}
+
+        sid = (data.get("session_id", "") or "").strip() or (cas.get("session_id", "") or "").strip()
+        if sid:
+            self._client_auth_session_id = sid
+
+        # 同步 OAuth client_id（若 dump 给出更准确值）
+        dump_client_id = (cas.get("openai_client_id", "") or data.get("openai_client_id", "") or "").strip()
+        if dump_client_id:
+            self._oauth_client_id = dump_client_id
+
+        wanted = {
+            "login_verifier", "code_verifier", "verifier", "pkce_verifier", "oauth_code_verifier",
+            "refresh_token", "oauth_refresh_token", "access_token", "id_token",
+        }
+        found: dict[str, str] = {}
+        self._walk_collect_str_fields(data, wanted, found)
+
+        # verifier 候选
+        for key in ("login_verifier", "code_verifier", "verifier", "pkce_verifier", "oauth_code_verifier"):
+            v = (found.get(key, "") or "").strip()
+            if v and len(v) >= 8:
+                self._dump_login_verifier = v
+                self._captured_login_verifier = v
+                logger.info("client_auth_session_dump 捕获 verifier: key=%s len=%s", key, len(v))
+                break
+
+        # token 候选（极少见，但若有直接收下）
+        refresh = (found.get("refresh_token", "") or found.get("oauth_refresh_token", "")).strip()
+        if refresh:
+            self.result.refresh_token = refresh
+        acc = (found.get("access_token", "") or "").strip()
+        if acc:
+            self.result.access_token = acc
+        idt = (found.get("id_token", "") or "").strip()
+        if idt:
+            self.result.id_token = idt
+
+        logger.debug(
+            "client_auth_session_dump(%s) 成功: top_keys=%s cas_keys=%s session_id=%s refresh=%s verifier=%s",
+            stage or "default",
+            list(data.keys())[:12],
+            list(cas.keys())[:18] if isinstance(cas, dict) else [],
+            (self._client_auth_session_id[:24] if self._client_auth_session_id else ""),
+            "有" if self.result.refresh_token else "无",
+            "有" if self._dump_login_verifier else "无",
+        )
+        return data
+
+    @staticmethod
+    def _is_tls_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        markers = ["curl: (35)", "tls connect error", "openssl_internal", "sslerror"]
+        return any(m in msg for m in markers)
+
+    @staticmethod
+    def _is_registration_disallowed_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "registration_disallowed" in msg
+
+    def _get_cookie_value_by_name(self, name: str) -> str:
+        """按 cookie 名称获取值（忽略 domain 冲突）。"""
+        try:
+            jar = getattr(self.session.cookies, "jar", None)
+            if jar is None:
+                return ""
+            target = (name or "").strip().lower()
+            for c in jar:
+                if (getattr(c, "name", "") or "").strip().lower() == target:
+                    return (getattr(c, "value", "") or "").strip()
+        except Exception:
+            pass
+        return ""
+
+    def _extract_login_challenge_from_cookie(self) -> str:
+        """
+        从 login_session cookie 中提取 login_challenge。
+        login_session 的第一段通常是 base64url(JSON)。
+        """
+        raw = self._get_cookie_value_by_name("login_session")
+        if not raw:
+            return ""
+        try:
+            p0 = raw.split(".")[0]
+            p0 += "=" * (-len(p0) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(p0.encode("utf-8")).decode("utf-8"))
+            return (payload.get("login_challenge", "") or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _extract_query_first(url: str, keys: list[str]) -> str:
+        if not url:
+            return ""
+        try:
+            qs = parse_qs(urlparse(url).query)
+        except Exception:
+            return ""
+        for k in keys:
+            val = qs.get(k, [None])[0]
+            if val:
+                return val
+        return ""
+
+    @staticmethod
+    def _extract_page_type(resp_json: dict | None) -> str:
+        if not isinstance(resp_json, dict):
+            return ""
+        page = resp_json.get("page", {})
+        if not isinstance(page, dict):
+            return ""
+        return (page.get("type", "") or "").strip()
+
+    @staticmethod
+    def _extract_continue_url_from_step(resp_json: dict | None) -> str:
+        """
+        从 auth step 响应提取 continue_url：
+        - 顶层 continue_url
+        - page.type=external_url 时 payload.url
+        """
+        if not isinstance(resp_json, dict):
+            return ""
+        continue_url = (resp_json.get("continue_url", "") or "").strip()
+        if continue_url:
+            return continue_url
+        page = resp_json.get("page", {})
+        if not isinstance(page, dict):
+            return ""
+        if (page.get("type", "") or "").strip() != "external_url":
+            return ""
+        payload = page.get("payload", {})
+        if not isinstance(payload, dict):
+            return ""
+        return (payload.get("url", "") or "").strip()
+
+    def _get_env(self, name: str, default: str = "") -> str:
+        """读配置：本次流程的 env_overrides 优先，回退进程环境变量。
+
+        registrar 通过 AuthFlow(env_overrides=...) 传入，不再写 os.environ，
+        所以并发跑多个号时互不干扰。命令行入口（register_outlook.py）没传
+        overrides，行为跟以前完全一样。
+        """
+        # getattr 兜底：部分测试/脚本用 __new__ 构造 AuthFlow 后直接调方法，
+        # 没有跑 __init__，这里不能假设 _env_overrides 一定存在。
+        v = getattr(self, "_env_overrides", {}).get(name)
+        return os.getenv(name, default) if v is None else str(v)
+
+    def _env_flag(self, name: str, default: str = "0") -> bool:
+        # 原本是 @staticmethod，为了读 self._env_overrides 改成实例方法。
+        # 调用点全是 self._env_flag(...)，签名不变。
+        return self._get_env(name, default).lower() in ("1", "true", "yes", "on")
+
+    def _human_pause(self, lo: float = 0.25, hi: float = 1.1) -> None:
+        """人类操作节奏：在关键步骤之间插入随机停顿。
+
+        全自动流程会把十几个请求以固定、极短的间隔连发，这是很强的机器特征；
+        这里按分布抖一下，**只改时序，不改任何请求内容**。
+        默认关闭（WEBUI_HUMANIZE=0），由 registrar 在生产路径开启，
+        这样单元测试不会被拖慢。
+
+        ⚠️ 分布形状本身也是特征。原来是 uniform(lo, hi)，即区间内等概率 ——
+        而真人操作间隔是**右偏长尾**：绝大多数是"看完就点"的短间隔，偶尔夹一个
+        较长的停顿（读内容、想一下、切窗口回来）。等概率分布意味着"恰好停在
+        中间那段时间"和"停在两端"一样常见，统计上很好识别。所以改成三段混合：
+
+            80%  区间下半段  —— 连续动作（输入、点击）
+            17%  区间上半段  —— 稍作停顿（瞄一眼再继续）
+             3%  hi ~ 2*hi   —— 长尾（思考 / 切窗口 / 页面卡了一下）
+
+        上界砍在 3*hi：长尾是用来提供形状的，不是用来让链路莫名其妙睡很久。
+        """
+        if not self._env_flag("WEBUI_HUMANIZE", "0"):
+            return
+        try:
+            span = max(0.0, float(hi) - float(lo))
+            roll = random.random()
+            if roll < 0.80:
+                value = random.uniform(lo, lo + span * 0.5)
+            elif roll < 0.97:
+                value = random.uniform(lo + span * 0.5, hi)
+            else:
+                value = random.uniform(hi, hi * 2.0)
+            time.sleep(min(value, max(hi * 3.0, 0.1)))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _oauth_url_path(url: str) -> str:
+        """Return only a URL path for OAuth diagnostics (never query values)."""
+        try:
+            return (urlparse(url or "").path or "")[:180]
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _oauth_response_metadata(payload: Any) -> tuple[list[str], str]:
+        """Log protocol field names and known error identifiers, never values."""
+        if not isinstance(payload, dict):
+            return [], ""
+        known_fields = {
+            "access_token", "refresh_token", "id_token", "token_type", "expires_in",
+            "scope", "error", "error_code", "code", "error_description", "error_uri",
+        }
+        keys = sorted(key for key in payload if key in known_fields)
+        if any(key not in known_fields for key in payload):
+            keys.append("[other]")
+        error = payload.get("error") or payload.get("error_code") or payload.get("code") or ""
+        if isinstance(error, dict):
+            error = error.get("code") or "unrecognized_error"
+        known_errors = {
+            "invalid_request", "invalid_client", "invalid_grant", "invalid_scope",
+            "unauthorized_client", "unsupported_grant_type", "unsupported_response_type",
+            "access_denied", "server_error", "temporarily_unavailable", "invalid_token",
+            "insufficient_scope", "interaction_required", "login_required", "consent_required",
+            "account_selection_required", "authorization_pending", "slow_down",
+            "expired_token", "phone_verification_required",
+        }
+        if not isinstance(error, str) or error not in known_errors:
+            error = "unrecognized_error" if error else ""
+        return keys, error
+
+    def _set_oauth_failure(self, reason: str, **details: Any) -> None:
+        """Record a redacted OAuth failure for logs and structured probes."""
+        self._oauth_failure_reason = str(reason or "oauth_failed")[:120]
+        safe: dict[str, Any] = {"reason": self._oauth_failure_reason}
+        for key in ("status_code", "response_keys", "error_code", "final_path", "sms_configured", "exception_type"):
+            if key not in details:
+                continue
+            value = details[key]
+            if key == "response_keys" and isinstance(value, (list, tuple)):
+                safe[key] = [str(item)[:80] for item in value[:20]]
+            elif key == "status_code":
+                try:
+                    safe[key] = int(value)
+                except (TypeError, ValueError):
+                    continue
+            elif key == "sms_configured":
+                safe[key] = bool(value)
+            else:
+                safe[key] = str(value or "")[:180]
+        self._oauth_failure_details = safe
+        logger.warning(
+            "Codex OAuth 失败: reason=%s details=%s",
+            self._oauth_failure_reason,
+            {key: value for key, value in safe.items() if key != "reason"},
+        )
+
+    @staticmethod
+    def _b64url_no_pad(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+    def _remember_oauth_params(self, auth_url: str):
+        """从 authorize URL 记住 OAuth 参数，供后续 token exchange 使用。"""
+        if not auth_url:
+            return
+        self._oauth_auth_url = auth_url
+        try:
+            qs = parse_qs(urlparse(auth_url).query)
+            self._oauth_client_id = (qs.get("client_id", [self._oauth_client_id])[0] or self._oauth_client_id).strip()
+            self._oauth_redirect_uri = (
+                qs.get("redirect_uri", [self._oauth_redirect_uri])[0] or self._oauth_redirect_uri
+            ).strip()
+            self._oauth_scope = (qs.get("scope", [""])[0] or "").strip()
+            self._oauth_state = (qs.get("state", [""])[0] or "").strip()
+        except Exception:
+            return
+
+    def _build_pkce_pair(self, raw_bytes: int = 64) -> tuple[str, str]:
+        """生成 (code_verifier, code_challenge)。"""
+        verifier = self._b64url_no_pad(secrets.token_bytes(max(32, int(raw_bytes))))
+        if len(verifier) < 43:
+            verifier = (verifier + ("A" * 43))[:43]
+        if len(verifier) > 128:
+            verifier = verifier[:128]
+        challenge = self._b64url_no_pad(hashlib.sha256(verifier.encode("utf-8")).digest())
+        return verifier, challenge
+
+    def _build_codex_authorize(self, prompt_override: Optional[str] = None) -> tuple[str, str, str, str, str]:
+        """
+        构建用于获取 refresh_token 的 Codex OAuth 授权 URL。
+        参考 any-auto-register 的实现：独立 client_id + redirect_uri + 可控 PKCE。
+        """
+        client_id = (os.getenv("OAUTH_CODEX_CLIENT_ID", "") or "").strip() or "app_EMoamEEZ73f0CkXaXp7hrann"
+        redirect_uri = (os.getenv("OAUTH_CODEX_REDIRECT_URI", "") or "").strip() or "http://localhost:1455/auth/callback"
+        scope = (os.getenv("OAUTH_CODEX_SCOPE", "") or "").strip() or "openid email profile offline_access"
+        state = self._b64url_no_pad(secrets.token_bytes(24))
+        verifier, challenge = self._build_pkce_pair()
+        prompt = (
+            (os.getenv("OAUTH_CODEX_PROMPT", "login") or "").strip()
+            if prompt_override is None
+            else (prompt_override or "").strip()
+        )
+        params = {
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "id_token_add_organizations": "true",
+            "codex_cli_simplified_flow": "true",
+        }
+        if prompt:
+            params["prompt"] = prompt
+        auth_url = f"https://auth.openai.com/oauth/authorize?{urlencode(params)}"
+        return auth_url, state, verifier, redirect_uri, client_id
+
+    @staticmethod
+    def _callback_has_code(url: str, redirect_uri: str) -> bool:
+        if not url:
+            return False
+        try:
+            cb_base = (redirect_uri or "").split("?", 1)[0].rstrip("/")
+            target = url.split("?", 1)[0].rstrip("/")
+            if cb_base and target == cb_base:
+                qs = parse_qs(urlparse(url).query)
+                return bool((qs.get("code", [""])[0] or "").strip())
+        except Exception:
+            return False
+        return False
+
+    def _follow_authorize_for_callback(self, start_url: str, redirect_uri: str, trace_prefix: str) -> tuple[str, str]:
+        """
+        跟随 auth.openai.com 授权链路，捕获 callback（不消费 callback）。
+        返回 (callback_url, final_url)。
+        """
+        current = start_url
+        callback_url = ""
+        self._oauth_authorize_status = None
+        chose_account = False  # /choose-an-account 每条链路只选一次，防 200/同 URL 循环
+        for i in range(12):
+            if self._callback_has_code(current, redirect_uri):
+                callback_url = current
+                break
+            resp = self.session.get(
+                current,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://chatgpt.com/",
+                    "User-Agent": self._ua,
+                },
+                timeout=30,
+                allow_redirects=False,
+            )
+            self._oauth_authorize_status = resp.status_code
+            self._trace_http(f"{trace_prefix}_hop_{i+1}", resp)
+
+            # workspace/consent 页面 200 时，主动选择 workspace，拿下一跳 continue_url
+            if resp.status_code == 200:
+                is_workspace_like = (
+                    ("/workspace" in current)
+                    or ("/sign-in-with-chatgpt/" in current)
+                    or ("/consent" in current)
+                )
+                if is_workspace_like:
+                    workspace_id = self._extract_workspace_id() or self._extract_workspace_id_from_html(resp.text or "")
+                    if workspace_id:
+                        next_url = self._workspace_select(workspace_id)
+                        if next_url:
+                            if next_url.startswith("/"):
+                                next_url = urljoin("https://auth.openai.com", next_url)
+                            current = next_url
+                            continue
+
+                # /choose-an-account：OpenAI 已登录多账号的选择页（react-router SSR）。
+                # HTML 里 streamController.enqueue 注入 unified_sessions[].id (us_*) 和
+                # authsess_*。protocol 端要主动选第一个 us_*，否则 codex callback 拿不到。
+                if "/choose-an-account" in current and not chose_account:
+                    chose_account = True
+                    next_url = self._choose_account_select(resp.text or "", current)
+                    if next_url:
+                        if next_url.startswith("/"):
+                            next_url = urljoin("https://auth.openai.com", next_url)
+                        current = next_url
+                        continue
+
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                break
+            loc = (resp.headers.get("Location", "") or "").strip()
+            if not loc:
+                break
+            if loc.startswith("/"):
+                loc = urljoin(current, loc)
+            if self._callback_has_code(loc, redirect_uri):
+                callback_url = loc
+                current = loc
+                break
+            current = loc
+        return callback_url, current
+
+    @staticmethod
+    def _drop_query_keys(url: str, drop_keys: set[str]) -> str:
+        if not url:
+            return ""
+        try:
+            parsed = urlparse(url)
+            params = parse_qsl(parsed.query, keep_blank_values=True)
+            kept = [(k, v) for (k, v) in params if (k or "").strip() not in drop_keys]
+            return urlunparse(parsed._replace(query=urlencode(kept)))
+        except Exception:
+            return url
+
+    def _exchange_codex_callback_code(
+        self,
+        callback_url: str,
+        expected_state: str,
+        verifier: str,
+        redirect_uri: str,
+        client_id: str,
+    ) -> bool:
+        qs = parse_qs(urlparse(callback_url).query)
+        code = (qs.get("code", [""])[0] or "").strip()
+        got_state = (qs.get("state", [""])[0] or "").strip()
+        if not code:
+            self._set_oauth_failure(
+                "callback_missing_code",
+                final_path=self._oauth_url_path(callback_url),
+            )
+            logger.warning("Codex callback 缺少 code")
+            return False
+        if expected_state and got_state != expected_state:
+            self._set_oauth_failure(
+                "callback_state_mismatch",
+                final_path=self._oauth_url_path(callback_url),
+            )
+            logger.warning("Codex callback state 缺失或不匹配")
+            return False
+
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "Origin": "https://auth.openai.com",
+            "Referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            "User-Agent": self._ua,
+        }
+        form = {
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+        }
+        encoded_form = urlencode(form)
+        resp = self.session.post(
+            "https://auth.openai.com/oauth/token",
+            headers=headers,
+            data=encoded_form,
+            timeout=30,
+        )
+        self._trace_http(
+            "oauth_token_exchange_codex_pkce",
+            resp,
+            extra_request={
+                "method": "POST",
+                "url": "https://auth.openai.com/oauth/token",
+                "body": encoded_form,
+                "headers": headers,
+            },
+        )
+        if resp.status_code != 200:
+            try:
+                error_payload = resp.json() if resp is not None else {}
+            except Exception:
+                error_payload = {}
+            error_keys, error_code = self._oauth_response_metadata(error_payload)
+            logger.warning(
+                "Codex oauth/token 失败: status=%s keys=%s error=%s",
+                resp.status_code,
+                error_keys,
+                error_code,
+            )
+            self._set_oauth_failure(
+                "token_http_error",
+                status_code=resp.status_code,
+                response_keys=error_keys,
+                error_code=error_code,
+            )
+            return False
+        try:
+            data = resp.json() if resp is not None else {}
+        except Exception as exc:
+            self._set_oauth_failure("token_invalid_json")
+            logger.warning(
+                "Codex oauth/token 响应 JSON 解析失败: %s",
+                type(exc).__name__,
+            )
+            return False
+        if not isinstance(data, dict):
+            self._set_oauth_failure("token_invalid_payload")
+            logger.warning("Codex oauth/token 返回非对象 JSON: type=%s", type(data).__name__)
+            return False
+        raw_refresh_token = data.get("refresh_token")
+        response_keys, error_code = self._oauth_response_metadata(data)
+        if raw_refresh_token is not None and not isinstance(raw_refresh_token, str):
+            self._set_oauth_failure(
+                "token_invalid_payload", status_code=resp.status_code, response_keys=response_keys,
+            )
+            return False
+        refresh_token = raw_refresh_token.strip() if isinstance(raw_refresh_token, str) else ""
+        self.result.id_token = data.get("id_token", self.result.id_token) or self.result.id_token
+        self.result.access_token = data.get("access_token", self.result.access_token) or self.result.access_token
+        logger.info(
+            "Codex OAuth 交换响应: keys=%s access=%s refresh=%s",
+            response_keys,
+            "有" if self.result.access_token else "无",
+            "有" if refresh_token else "无",
+        )
+        if not refresh_token:
+            # HTTP 200 only means the token endpoint accepted the request.  A
+            # response without refresh_token cannot satisfy this exchange and
+            # must propagate False so the run probe and caller can retry or
+            # fail the task with a useful diagnostic.
+            logger.warning(
+                "Codex oauth/token 响应缺少 refresh_token: status=%s keys=%s error=%s",
+                resp.status_code,
+                response_keys,
+                error_code,
+            )
+            self._set_oauth_failure(
+                "token_missing_refresh_token",
+                status_code=resp.status_code,
+                response_keys=response_keys,
+                error_code=error_code,
+            )
+            return False
+        self.result.refresh_token = refresh_token
+        self._oauth_failure_reason = ""
+        self._oauth_failure_details = {}
+        return True
+
+    def _codex_drive_login_from_log_in(self, mail_provider: Optional[MailProvider] = None) -> str:
+        """
+        当 Codex 授权回落到 /log-in 时，补走一次纯协议登录推进状态机。
+        返回可继续跟随的 continue_url（若无则返回空字符串）。
+        """
+        email = (self.result.email or "").strip()
+        if not email:
+            logger.warning("Codex 登录推进缺少 email")
+            return ""
+        password, pw_is_real = self._resolve_login_password(email)
+        if pw_is_real:
+            self.result.password = password
+        else:
+            # 猜的密码只拿去碰一下 401，不落进 result（否则会被当成真密码存库/打日志）
+            logger.info("Codex 登录推进：该号无已知密码，用默认规则猜一个试试（多半 401）")
+
+        device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+        if not device_id:
+            device_id = str(uuid.uuid4())
+            self.result.device_id = device_id
+
+        sentinel = self.get_sentinel_token(device_id)
+        step = self.authorize_continue(
+            email=email,
+            sentinel_token=sentinel,
+            screen_hint="login",
+            referer="https://auth.openai.com/log-in",
+            trace_step="authorize_continue_login_codex",
+        )
+        page_type = self._extract_page_type(step)
+        continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
+
+        if page_type == "login_password" or "/log-in/password" in continue_url:
+            step = self.login_password_verify(password)
+            page_type = self._extract_page_type(step)
+            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
+
+        # mfa-challenge 分支（密码验证后需要 TOTP 2FA）
+        if self._is_mfa_challenge_state(page_type, continue_url):
+            totp_secret = (self.result.totp_secret or "").strip()
+            if not totp_secret and self._account_callback:
+                # 从数据库加载凭证
+                try:
+                    cred = self._account_callback(email)
+                    if cred and cred.get("totp_secret"):
+                        totp_secret = cred["totp_secret"]
+                        self.result.totp_secret = totp_secret
+                        logger.info("已从数据库加载 totp_secret")
+                except Exception as e:
+                    logger.warning(f"account_callback 异常: {e}")
+            if not totp_secret:
+                logger.warning("进入 mfa-challenge 但没有 totp_secret，无法继续")
+                return continue_url or ""
+            # 从 continue_url 提取 challenge_id
+            challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
+            if not challenge_id:
+                logger.warning("无法从 continue_url 提取 challenge_id")
+                return continue_url or ""
+            # 计算当前 TOTP 码并提交
+            totp_code = _totp_now(totp_secret)
+            logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
+            mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
+            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(mfa_resp))
+
+        need_otp = (page_type == "email_otp_verification") or _looks_like_email_verify_url(continue_url or "")
+        if need_otp:
+            if mail_provider is None:
+                logger.warning("Codex 登录推进需要 OTP，但未提供 mail_provider")
+                return continue_url or ""
+            try:
+                otp_timeout = max(180, int(self._get_env("OTP_TIMEOUT", "180")))
+            except Exception:
+                otp_timeout = 180
+            otp_sent_at = time.time()
+            if not self.kickoff_otp_delivery("codex_login_need_otp"):
+                self.send_otp()
+            otp_code = mail_provider.wait_for_otp(
+                email,
+                timeout=otp_timeout,
+                issued_after=otp_sent_at,
+            )
+            otp_resp = self.verify_otp(otp_code)
+            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(otp_resp))
+
+        # add-phone 分支（可选）：
+        # 仅在配置了手机号与验证码获取方式时尝试自动推进
+        if self._is_add_phone_state(page_type="", continue_url=continue_url):
+            next_url = self._handle_add_phone_verification(continue_url=continue_url)
+            if next_url:
+                continue_url = self._normalize_continue_url(next_url)
+
+        return continue_url or ""
+
+    @staticmethod
+    def _is_add_phone_state(page_type: str = "", continue_url: str = "") -> bool:
+        pt = (page_type or "").strip().lower()
+        cu = (continue_url or "").strip().lower()
+        return (pt == "add_phone") or ("add-phone" in cu)
+
+    @staticmethod
+    def _is_mfa_challenge_state(page_type: str = "", continue_url: str = "") -> bool:
+        """判断是否进入 mfa-challenge 状态（已有账号启用 2FA，密码验证后需要 TOTP 码）。"""
+        pt = (page_type or "").strip().lower()
+        cu = (continue_url or "").strip().lower()
+        return (pt == "mfa_challenge") or ("/mfa-challenge/" in cu)
+
+    def _phone_headers(self, referer: str) -> dict:
+        headers = self._common_headers(referer)
+        headers["Accept"] = "application/json"
+        headers["Content-Type"] = "application/json"
+        headers["Origin"] = "https://auth.openai.com"
+        device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+        if device_id:
+            headers["oai-device-id"] = device_id
+        return headers
+
+    def _add_phone_send(self, phone_number: str) -> dict:
+        headers = self._phone_headers("https://auth.openai.com/add-phone")
+        try:
+            resp = self.session.post(
+                "https://auth.openai.com/api/accounts/add-phone/send",
+                headers=headers,
+                json={"phone_number": phone_number},
+                timeout=30,
+            )
+        except Exception as e:
+            logger.warning("[add-phone] 网络异常: %s (phone=%s)", e, phone_number)
+            raise
+        self._trace_http("add_phone_send", resp)
+
+        if resp.status_code != 200:
+            # 解析 error.message（如果有的话）
+            try:
+                data = resp.json()
+                msg = data.get("error", {}).get("message", "")
+                code = data.get("error", {}).get("code", "")
+            except Exception:
+                msg = resp.text[:150]
+                code = ""
+            # 抛异常时只带 message（不带完整 JSON），让上层日志更简洁
+            raise RuntimeError(msg or f"HTTP {resp.status_code}")
+
+        try:
+            return resp.json() if resp is not None else {}
+        except Exception:
+            return {}
+
+    def _phone_otp_resend(self) -> bool:
+        headers = self._phone_headers("https://auth.openai.com/phone-verification")
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/phone-otp/resend",
+            headers=headers,
+            timeout=30,
+        )
+        self._trace_http("phone_otp_resend", resp)
+        return resp.status_code == 200
+
+    def _phone_otp_validate(self, code: str) -> dict:
+        headers = self._phone_headers("https://auth.openai.com/phone-verification")
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/phone-otp/validate",
+            headers=headers,
+            json={"code": code},
+            timeout=30,
+        )
+        self._trace_http("phone_otp_validate", resp)
+        if resp.status_code != 200:
+            raise RuntimeError(f"phone-otp/validate 失败: {resp.status_code} - {(resp.text or '')[:220]}")
+        try:
+            return resp.json() if resp is not None else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _extract_otp6(text: str) -> str:
+        if not text:
+            return ""
+        m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+        return (m.group(1) if m else "").strip()
+
+    def _read_phone_otp_from_cmd(self) -> str:
+        """
+        从环境变量 OPENAI_PHONE_OTP_CMD 指定的命令读取手机验证码（stdout）。
+        命令输出中只要出现 6 位数字即视为命中。
+        """
+        cmd = (os.getenv("OPENAI_PHONE_OTP_CMD", "") or "").strip()
+        if not cmd:
+            return ""
+        try:
+            out = subprocess.check_output(cmd, shell=True, text=True, timeout=20)
+            return self._extract_otp6(out or "")
+        except Exception:
+            return ""
+
+    def _wait_phone_otp(self, timeout: int = 180) -> str:
+        static_otp = self._extract_otp6(os.getenv("OPENAI_PHONE_OTP", "") or "")
+        if static_otp:
+            return static_otp
+
+        deadline = time.time() + max(20, int(timeout))
+        while time.time() < deadline:
+            code = self._read_phone_otp_from_cmd()
+            if code:
+                return code
+            time.sleep(4)
+        raise TimeoutError(f"等待手机 OTP 超时 ({timeout}s)")
+
+    def _handle_add_phone_verification(self, continue_url: str = "") -> str:
+        """
+        处理 add-phone 验证分支：
+        - 优先使用 self._sms_callback（SMS 接码 controller，自动租号 + 接码）
+        - 回退到环境变量路径：OPENAI_PHONE_NUMBER + OPENAI_PHONE_OTP_CMD/OPENAI_PHONE_OTP
+        """
+        if self._sms_callback is not None:
+            try:
+                return self._handle_add_phone_via_sms(continue_url)
+            except Exception as e:
+                logger.warning("SMS 接码流程失败，回退环境变量路径: %s", e)
+                try:
+                    self._sms_callback.cleanup()
+                except Exception:
+                    pass
+        return self._handle_add_phone_via_env(continue_url)
+
+    def _handle_add_phone_via_sms(self, continue_url: str = "") -> str:
+        """走 SMS 接码 controller：租号 → add-phone/send → 等 SMS → validate。
+
+        支持平台：SmsBower（smsbower.page）。
+        单号窗口 80s（每 20s × 3 触发一次 OpenAI 端 resend）；失败自动 cancel + 换新号。
+        最多换号次数默认 3，主人可在 WebUI / 环境变量 OPENAI_PHONE_MAX_ATTEMPTS 自定义。
+        """
+        ctrl = self._sms_callback
+        try:
+            ctrl.set_resend_callback(self._phone_otp_resend)
+        except Exception:
+            pass
+
+        # 用 try/finally 保证即使 for 循环抛异常，也能 release lock + 最后一次 cleanup
+        try:
+            return self._do_sms_loop(ctrl)
+        finally:
+            # 无论成败都释放 lock + cleanup 最后一个号（如果有）
+            try:
+                ctrl.cleanup()
+            except Exception:
+                pass
+            try:
+                ctrl._release_lock()
+            except Exception:
+                pass
+
+    def _do_sms_loop(self, ctrl) -> str:
+        """SMS 接码循环逻辑（for 0..max_attempts）。"""
+        # provider 信息（目前只支持 SmsBower）
+        provider_key = (getattr(ctrl, "provider_key", "") or "").lower()
+
+        # 优先从 controller.config 读（前端配置） → 环境变量兜底 → 用默认
+        ctrl_cfg = getattr(ctrl, "config", None) or {}
+
+        def _read_int(cfg_key: str, env_key: str, default: str, min_v: int = 1) -> int:
+            raw = (str(ctrl_cfg.get(cfg_key) or "")).strip()
+            if not raw:
+                raw = os.getenv(env_key, default)
+            try:
+                return max(min_v, int(raw))
+            except Exception:
+                return int(default)
+
+        # 单号等待窗口（秒）：默认 80 = 20×3 + 20 缓冲
+        per_phone_timeout = max(40, _read_int(
+            "sms_per_phone_timeout", "OPENAI_PHONE_OTP_TIMEOUT", "80", min_v=40
+        ))
+        # 最多换几个号（默认 3）
+        max_phone_attempts = _read_int(
+            "sms_max_phone_attempts", "OPENAI_PHONE_MAX_ATTEMPTS", "3"
+        )
+        # 单号内 code validate 失败后的重试次数（如果还有时间）
+        max_code_retries_per_phone = _read_int(
+            "sms_code_retries_per_phone", "OPENAI_PHONE_OTP_CODE_RETRIES", "2"
+        )
+
+        logger.info(
+            "[sms] 配置: provider=%s 单号窗口=%ds 最多换号=%d 单号内验证重试=%d",
+            provider_key, per_phone_timeout, max_phone_attempts, max_code_retries_per_phone,
+        )
+
+        # OpenAI "号已被使用 / 不允许" 类错误关键字
+        _PHONE_REJECTED_PATTERNS = (
+            "phone_number_already_in_use", "already_in_use", "already_taken",
+            "phone_already_verified", "already_verified",
+            "disallowed_phone", "invalid_phone_number", "phone_number_invalid",
+            "blocked_phone", "phone_number_blocked",
+            "suspicious behavior from phone",  # OpenAI 风控：号段可疑
+        )
+        def _is_phone_rejected(s: str) -> bool:
+            sl = (s or "").lower()
+            return any(p in sl for p in _PHONE_REJECTED_PATTERNS)
+
+        last_err: Optional[Exception] = None
+
+        for phone_attempt in range(1, max_phone_attempts + 1):
+            logger.info("[sms] 🔁 第 %d/%d 个号尝试...", phone_attempt, max_phone_attempts)
+
+            # 阶段 1：租号（第 2+ 个号会自动租新号，SmsBower cache 已被前一次 cleanup 清掉）
+            try:
+                phone = ctrl.get_phone()
+            except Exception as e:
+                last_err = e
+                logger.warning("[sms] 第 %d 个号租号失败: %s", phone_attempt, e)
+                continue
+            if not phone:
+                last_err = RuntimeError("SMS 接码 controller 未返回手机号")
+                continue
+
+            # 阶段 2：通知 OpenAI 发码到这个号
+            send_resp = None
+            try:
+                logger.info("[sms] 📤 准备 POST add-phone/send (phone=%s) ...", phone)
+                send_resp = self._add_phone_send(phone)
+                logger.info("[sms] ✅ POST add-phone/send 成功 (phone=%s)", phone)
+            except Exception as e:
+                err_text = str(e)
+                if "too many phone verification" in err_text.lower() \
+                        or "phone_verification_rate_limit" in err_text.lower():
+                    logger.warning(
+                        "⚠️ OpenAI 频控: 这个 outlook 号/IP 已累积太多 add-phone 请求，"
+                        "建议换 outlook 号或换代理 IP 后重试。本次放弃 add-phone（session_token 仍可保留）"
+                    )
+                    ctrl.mark_send_failed(err_text)
+                    last_err = e
+                    break
+                if _is_phone_rejected(err_text):
+                    logger.warning("[sms] 号 %s 被 OpenAI 拒（已用过/不允许）: %s",
+                                   phone, err_text[:200])
+                    ctrl.mark_send_failed(err_text)
+                    last_err = e
+                    continue
+                # 其它未识别错误 → 也打详细日志但不视为"号码问题"
+                logger.warning("[sms] 号 %s POST add-phone/send 失败（未识别错误）: %s",
+                               phone, err_text[:300])
+                ctrl.mark_send_failed(err_text)
+                last_err = e
+                continue
+
+            send_page_type = self._extract_page_type(send_resp)
+            send_continue = self._normalize_continue_url(self._extract_continue_url_from_step(send_resp))
+            if send_page_type not in ("phone_otp_verification", "external_url") \
+                    and "phone-verification" not in (send_continue or ""):
+                logger.warning(
+                    "add-phone/send 未进入手机验证码页: page=%s continue=%s",
+                    send_page_type or "(empty)",
+                    (send_continue or "")[:180],
+                )
+                ctrl.mark_send_failed("did not enter phone-verification page")
+                last_err = RuntimeError(f"add-phone/send 未进入 phone-verification: page={send_page_type}")
+                continue
+
+            ctrl.mark_send_succeeded()
+
+            # 阶段 3：等 SMS code（SmsBower 内部会按 20s × 3 调 OpenAI resend）
+            phone_start = time.time()
+            seen_codes: set[str] = set()
+            code_attempt = 0
+            phone_used = False
+
+            while time.time() - phone_start < per_phone_timeout and code_attempt < max_code_retries_per_phone:
+                remaining = per_phone_timeout - (time.time() - phone_start)
+                if remaining < 10:
+                    break
+                code_attempt += 1
+                logger.info(
+                    "[sms] 号 %s 第 %d/%d 次等 SMS (剩余 %ds)",
+                    phone, code_attempt, max_code_retries_per_phone, int(remaining),
+                )
+                code = ctrl.get_code(timeout=int(remaining))
+                if not code:
+                    break  # 超时换号
+                if code in seen_codes:
+                    logger.warning("[sms] 收到重复 code=%s，跳过", code)
+                    continue
+                seen_codes.add(code)
+                phone_used = True
+
+                try:
+                    validate_resp = self._phone_otp_validate(code)
+                    next_url = self._normalize_continue_url(
+                        self._extract_continue_url_from_step(validate_resp)
+                    )
+                    logger.info("[sms] ✅ phone-otp/validate 通过 (phone=%s code=%s) next=%s",
+                                phone, code, (next_url or "")[:160])
+                    ctrl.report_success()
+                    return next_url or continue_url or ""
+                except Exception as e:
+                    last_err = e
+                    err_text = str(e)
+                    logger.warning("[sms] validate 失败 (phone=%s code=%s): %s",
+                                   phone, code, err_text[:200])
+                    ctrl.mark_code_failed(err_text)
+                    # 继续 while 循环等下一条 code（同号）
+
+            # 单号窗口结束：cancel 这个号
+            logger.warning("[sms] 号 %s 已用尽 %ds 窗口", phone, per_phone_timeout)
+            try:
+                ctrl.cleanup()
+            except Exception:
+                pass
+            # cleanup 清掉 controller.activation，下一轮 get_phone 会租新号
+
+        # 所有号都失败
+        if last_err:
+            raise last_err
+        raise RuntimeError(f"SMS 接码 {max_phone_attempts} 个号均失败")
+
+    def _handle_add_phone_via_env(self, continue_url: str = "") -> str:
+        """
+        处理 add-phone 验证分支（环境变量路径，旧用法）：
+        - 需要通过环境变量提供号码与验证码来源：
+          - OPENAI_PHONE_NUMBER=+1...
+          - OPENAI_PHONE_OTP_CMD='...返回短信内容...' 或 OPENAI_PHONE_OTP=123456
+        """
+        phone_raw = (os.getenv("OPENAI_PHONE_NUMBER", "") or "").strip()
+        phone_candidates = [x.strip() for x in phone_raw.split(",") if x.strip()]
+        if not phone_candidates:
+            logger.warning("命中 add-phone，但未配置 SMS 接码 / OPENAI_PHONE_NUMBER，无法继续推进")
+            return continue_url or ""
+
+        try:
+            otp_timeout = max(30, int(os.getenv("OPENAI_PHONE_OTP_TIMEOUT", "180")))
+        except Exception:
+            otp_timeout = 180
+
+        last_err = ""
+        for idx, phone in enumerate(phone_candidates, 1):
+            try:
+                logger.info("add-phone 尝试号码 %s/%s: %s", idx, len(phone_candidates), phone)
+                send_resp = self._add_phone_send(phone)
+                send_page_type = self._extract_page_type(send_resp)
+                send_continue = self._normalize_continue_url(self._extract_continue_url_from_step(send_resp))
+                if send_page_type not in ("phone_otp_verification", "external_url") and "phone-verification" not in (send_continue or ""):
+                    logger.warning(
+                        "add-phone/send 未进入手机验证码页: page=%s continue=%s",
+                        send_page_type or "(empty)",
+                        (send_continue or "")[:180],
+                    )
+                    continue
+
+                phone_code = self._wait_phone_otp(timeout=otp_timeout)
+                validate_resp = self._phone_otp_validate(phone_code)
+                next_url = self._normalize_continue_url(self._extract_continue_url_from_step(validate_resp))
+                logger.info("add-phone 验证通过，next=%s", (next_url or "")[:180])
+                return next_url or continue_url or ""
+            except Exception as e:
+                last_err = str(e)
+                logger.warning("add-phone 号码 %s 失败: %s", phone, e)
+                try:
+                    self._phone_otp_resend()
+                except Exception:
+                    pass
+
+        if last_err:
+            logger.warning("add-phone 阶段未成功: %s", last_err)
+        return continue_url or ""
+
+    def _codex_refresh_retry_after_add_phone(
+        self,
+        auth_url: str,
+        redirect_uri: str,
+        attempts: int = 3,
+        sleep_seconds: float = 1.2,
+    ) -> tuple[str, str]:
+        """
+        当命中 add-phone 时，按“刷新重试”策略重复发起 authorize，
+        期望命中不需要 add-phone 的分支并直接拿 callback code。
+        """
+        callback_url = ""
+        final_url = ""
+        start_url = self._drop_query_keys(auth_url, {"prompt"}) or auth_url
+        rounds = max(1, int(attempts))
+        wait_s = max(0.0, float(sleep_seconds))
+
+        for i in range(rounds):
+            callback_url, final_url = self._follow_authorize_for_callback(
+                start_url,
+                redirect_uri,
+                f"codex_add_phone_refresh_retry_{i+1}",
+            )
+            if callback_url:
+                return callback_url, final_url
+            if i < rounds - 1 and wait_s > 0:
+                time.sleep(wait_s)
+
+        return callback_url, final_url
+
+    def oauth_codex_rt_exchange(self, mail_provider: Optional[MailProvider] = None) -> bool:
+        """
+        纯协议方式获取 RT（参考 any-auto-register）：
+        - 使用独立 Codex OAuth 参数重新授权（可控 PKCE）
+        - 捕获 callback code（不消费）
+        - 直接调 /oauth/token 交换 access_token + refresh_token
+        """
+        allow_retry = self._env_flag("OAUTH_CODEX_RT_ALLOW_RETRY", "0")
+        if self._codex_rt_attempted and (not allow_retry):
+            logger.debug("Codex RT 本轮已尝试过，跳过重复尝试")
+            return False
+        self._codex_rt_attempted = True
+        self._oauth_failure_reason = ""
+        self._oauth_failure_details = {}
+
+        logger.info("尝试 Codex OAuth 直连换取 refresh_token ...")
+        try:
+            auth_url, state, verifier, redirect_uri, client_id = self._build_codex_authorize()
+            self._oauth_auth_url = auth_url
+            self._oauth_client_id = client_id
+            self._oauth_redirect_uri = redirect_uri
+            self._oauth_state = state
+            self._manual_login_verifier = verifier
+            self._captured_login_verifier = verifier
+            callback_url, final_url = self._follow_authorize_for_callback(
+                auth_url, redirect_uri, "codex_authorize"
+            )
+
+            # 若被打回 /log-in，补走一次协议登录，再继续授权链路
+            if (not callback_url) and "/log-in" in (final_url or ""):
+                logger.info("Codex 授权回落到 /log-in，尝试协议推进登录状态...")
+                continue_url = ""
+                try:
+                    continue_url = self._codex_drive_login_from_log_in(mail_provider=mail_provider)
+                except Exception as e:
+                    logger.warning(f"Codex 登录推进失败，改走 no-prompt 兜底: {e}")
+                if continue_url:
+                    # 命中 add-phone 时，支持“刷新重试”策略（不立刻放弃）
+                    if self._is_add_phone_state(page_type="", continue_url=continue_url) and self._env_flag(
+                        "OAUTH_CODEX_ADD_PHONE_REFRESH_RETRY", "1"
+                    ):
+                        try:
+                            retry_count = max(1, int(os.getenv("OAUTH_CODEX_ADD_PHONE_REFRESH_RETRY_COUNT", "3")))
+                        except Exception:
+                            retry_count = 3
+                        try:
+                            retry_sleep = max(0.0, float(os.getenv("OAUTH_CODEX_ADD_PHONE_REFRESH_SLEEP", "1.2")))
+                        except Exception:
+                            retry_sleep = 1.2
+                        logger.info("命中 add-phone，执行 authorize 刷新重试: count=%s sleep=%.1fs", retry_count, retry_sleep)
+                        callback_url, final_url = self._codex_refresh_retry_after_add_phone(
+                            auth_url=auth_url,
+                            redirect_uri=redirect_uri,
+                            attempts=retry_count,
+                            sleep_seconds=retry_sleep,
+                        )
+                    else:
+                        callback_url, final_url = self._follow_authorize_for_callback(
+                            continue_url,
+                            redirect_uri,
+                            "codex_post_login",
+                        )
+
+            # Codex authorize 直接被打到 /add-phone（不经过 /log-in）：
+            # 如果配了 SMS 接码 controller，先把手机号绑了再重新 authorize
+            if (not callback_url) and self._is_add_phone_state(page_type="", continue_url=final_url or "") \
+                    and self._sms_callback is not None:
+                logger.info("Codex 授权直接落到 /add-phone，尝试 SMS 接码绑号 ...")
+                try:
+                    self._handle_add_phone_via_sms(continue_url=final_url)
+                    # 绑号成功后重新 authorize 拿 callback code
+                    callback_url, final_url = self._follow_authorize_for_callback(
+                        auth_url, redirect_uri, "codex_authorize_after_add_phone"
+                    )
+                    if not callback_url:
+                        no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
+                        if no_prompt_url and no_prompt_url != auth_url:
+                            callback_url, final_url = self._follow_authorize_for_callback(
+                                no_prompt_url,
+                                redirect_uri,
+                                "codex_authorize_noprompt_after_add_phone",
+                            )
+                except Exception as e:
+                    logger.warning(f"SMS 接码绑号失败: {e}")
+
+            # 兜底：去掉 prompt=login 再发起一次授权
+            if not callback_url:
+                no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
+                if no_prompt_url and no_prompt_url != auth_url:
+                    callback_url, final_url = self._follow_authorize_for_callback(
+                        no_prompt_url,
+                        redirect_uri,
+                        "codex_authorize_noprompt",
+                    )
+
+            if not callback_url:
+                final_path = self._oauth_url_path(final_url)
+                final_status = getattr(self, "_oauth_authorize_status", None)
+                reason = (
+                    "authorize_http_error"
+                    if isinstance(final_status, int) and final_status >= 400
+                    else "phone_verification_required"
+                    if final_path.rstrip("/") in {"/add-phone", "/phone-verification"}
+                    else "callback_not_returned"
+                )
+                self._set_oauth_failure(
+                    reason,
+                    status_code=final_status,
+                    final_path=final_path,
+                    sms_configured=self._sms_callback is not None,
+                )
+                logger.info("Codex OAuth 未捕获 callback code: final_path=%s", final_path or "-")
+                return False
+            return self._exchange_codex_callback_code(
+                callback_url=callback_url,
+                expected_state=state,
+                verifier=verifier,
+                redirect_uri=redirect_uri,
+                client_id=client_id,
+            )
+        except Exception as e:
+            self._set_oauth_failure("oauth_exception", exception_type=type(e).__name__)
+            return False
+
+    def _inject_pkce_into_auth_url(self, auth_url: str) -> str:
+        """为 authorize URL 注入 PKCE 参数（可选）。"""
+        if not auth_url:
+            return auth_url
+        if not self._env_flag("OAUTH_SECONDARY_PKCE", "0"):
+            return auth_url
+
+        try:
+            parsed = urlparse(auth_url)
+            params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            if params.get("code_challenge") and params.get("code_challenge_method"):
+                return auth_url
+
+            verifier, challenge = self._build_pkce_pair()
+            params["code_challenge"] = challenge
+            params["code_challenge_method"] = "S256"
+            new_url = urlunparse(parsed._replace(query=urlencode(params)))
+            # 若用户未手动指定 verifier，则自动注入本轮 verifier
+            if not self._manual_login_verifier:
+                self._manual_login_verifier = verifier
+            logger.info(
+                "已启用二次 PKCE 注入: verifier_len=%s challenge=%s...",
+                len(verifier),
+                challenge[:16],
+            )
+            return new_url
+        except Exception as e:
+            logger.warning(f"注入 PKCE 参数失败，回退原始 auth_url: {e}")
+            return auth_url
+
+    @staticmethod
+    def _safe_b64url_decode_text(data: str) -> str:
+        if not data:
+            return ""
+        try:
+            s = data + "=" * (-len(data) % 4)
+            return base64.urlsafe_b64decode(s.encode("utf-8")).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def _extract_hydra_redirect_values(self) -> list[str]:
+        """从 hydra_redirect cookie 中提取可能的会话值。"""
+        raw = self._get_cookie_value_by_name("hydra_redirect")
+        if not raw:
+            return []
+        out: list[str] = []
+        try:
+            p0 = (raw.split(".", 1)[0] or "").strip()
+            text = self._safe_b64url_decode_text(p0)
+            if text:
+                obj = json.loads(text)
+                if isinstance(obj, dict):
+                    for v in obj.values():
+                        if isinstance(v, str) and v.strip():
+                            vv = v.strip()
+                            out.append(vv)
+                            if "|" in vv:
+                                out.extend([x for x in vv.split("|") if isinstance(x, str) and x.strip()])
+        except Exception:
+            return out
+        return out
+
+    def _collect_code_verifier_candidates(self, callback_url: str, continue_url: str) -> list[tuple[str, str]]:
+        """收集 code_verifier 候选（来源 + 值）。"""
+        raw_candidates: list[tuple[str, str]] = [
+            ("query", self._extract_query_first(continue_url, ["login_verifier", "code_verifier", "verifier"])),
+            ("query_callback", self._extract_query_first(callback_url, ["login_verifier", "code_verifier", "verifier"])),
+            ("dump", self._dump_login_verifier),
+            ("captured", self._captured_login_verifier),
+            ("manual", self._manual_login_verifier),
+            ("cookie_login_verifier", self._get_cookie_value_by_name("login_verifier")),
+            ("cookie_code_verifier", self._get_cookie_value_by_name("code_verifier")),
+            ("cookie_login_challenge", self._extract_login_challenge_from_cookie()),
+            ("cookie_nextauth_state", self._get_cookie_value_by_name("__Secure-next-auth.state")),
+        ]
+
+        # hydra_redirect 中可能包含编码后的 csrf/session 串，作为实验候选
+        for i, hv in enumerate(self._extract_hydra_redirect_values()):
+            raw_candidates.append((f"hydra_{i}", hv))
+
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        max_len = max(128, int(os.getenv("OAUTH_MAX_VERIFIER_LEN", "4096")))
+        for src, val in raw_candidates:
+            v = (val or "").strip()
+            if not v:
+                continue
+            if len(v) > max_len:
+                v = v[:max_len]
+            if v not in seen:
+                seen.add(v)
+                out.append((src, v))
+            # PKCE 标准长度 43~128；对超长候选补一个截断版本
+            if len(v) > 128:
+                v128 = v[:128]
+                if v128 not in seen:
+                    seen.add(v128)
+                    out.append((f"{src}_trunc128", v128))
+
+        return out
+
+    def _rotate_impersonate_session(self) -> bool:
+        """仅在 curl_cffi 指纹模式内切换 UA 指纹版本重试，同时联动更新 UA。
+
+        ⚠️ 这里必须连 self._fingerprint 里的 client hints 一起换掉。
+        旧版只更新了 self._ua 和 session —— 但 _common_headers / _navigation_headers
+        的 sec-ch-ua* 全是从 self._fingerprint 取的，于是换完会变成
+        「UA 说 Chrome/136、sec-ch-ua 说 v=146」，连 not_a_brand 都对不上
+        （三个版本各不相同："Not.A/Brand";v="99" / "Not/A)Brand";v="8" /
+        "Not?A_Brand";v="99"）—— 这正是上一轮刚消灭的「UA 与头自相矛盾」，
+        是 CF 最容易抓的特征。之前没爆只因这条路几乎没走到过。
+
+        fallback_impersonates 是**同家族**构造的（见 fingerprint.py 各 _gen_*），
+        所以只会 chrome→chrome、safari→safari，不会跨族；但同族换版本一样要同步头。
+        """
+        if self._impersonate_idx >= len(self._impersonate_candidates) - 1:
+            return False
+        self._impersonate_idx += 1
+        imp = self._impersonate_candidates[self._impersonate_idx]
+        self._ua = ua_for_impersonate(imp, self._ua)
+        # 让 client hints 跟上新版本，保持 UA 与头自洽
+        try:
+            self._fingerprint = fingerprint_for_impersonate(imp, self._fingerprint)
+        except Exception as e:  # 兜底：宁可维持旧指纹也不要把流程搞崩
+            logger.warning(f"client hints 同步失败（沿用旧指纹）: {e}")
+        logger.warning(f"TLS 异常，切换指纹重试: impersonate={imp}, ua={self._ua[:60]}...")
+        self.session = create_http_session(
+            proxy=self.config.proxy, impersonate=imp, user_agent=self._ua,
+        )
+        if not self._verify_session_exit("impersonate.rotate"):
+            return False
+        return True
+
+    def _rebind_exit_after_drift(
+        self, expected_ip: str, observed_ip: str, observed_country: str
+    ) -> bool:
+        """预检阶段出口漂移的自愈：把冻结环境改绑到稳定观察到的新出口。
+
+        只在 `check_proxy` 里调用 —— 此刻任务**还没向 OpenAI 发出任何请求**
+        （只打了 cloudflare trace），换出口对 OpenAI 侧不可见，所以不存在
+        「同一个号中途换 IP」这种风控信号。改绑之后任务全程只用新出口，
+        「任务内单一出口」这条不变量照旧成立。
+
+        拒绝改绑的三种情况（返回 False，调用方按原逻辑中止）：
+          - 新出口国家与冻结画像国家不一致：画像的时区/语言是按国家生成的，
+            换了国家就会出现「出口在 A 国、时区在 B 国」的一眼假环境，
+            这种情况宁可换一轮任务；
+          - 新出口已在台账/历史任务里用过：任务间唯一不能破；
+          - 没接线（CLI 单独跑，没有持久层）：不冒「改了但没记录」的风险。
+        """
+        rebind = getattr(self, "_environment_rebind", None)
+        if not callable(rebind):
+            return False
+        expected_country = str(
+            self._environment.get("country_code")
+            or self._environment.get("exit_country")
+            or self._fingerprint.get("country_code")
+            or self._country_code
+            or ""
+        ).strip().upper()
+        new_country = (observed_country or "").strip().upper()
+        if expected_country and new_country and new_country != expected_country:
+            logger.warning(
+                "出口漂移且国家也变了（%s -> %s），不做改绑",
+                expected_country,
+                new_country,
+            )
+            return False
+        try:
+            if not rebind(expected_ip, observed_ip, new_country):
+                return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("出口改绑失败，按原逻辑中止: %s", redact_probe_error(exc))
+            return False
+
+        # 内存环境同步改绑：后续所有检查、日志、落库都以新出口为准。
+        self._environment["exit_ip"] = observed_ip
+        if new_country:
+            self._environment["exit_country"] = new_country
+        self._environment["session_reserved_at"] = time.time()
+        logger.warning(
+            "任务出口已改绑到稳定出口: %s -> %s（%s）；此时尚未接触 OpenAI，任务继续",
+            expected_ip,
+            observed_ip,
+            new_country or "未知地区",
+        )
+        # 补一条改绑后的观测：运行时间线里既能看到漂移、也能看到改绑后校验通过，
+        # 不会留下一条 all_passed=False 却继续跑的矛盾记录。
+        if self._environment_observer:
+            try:
+                exit_report = compare_exit_observation(
+                    self._environment,
+                    exit_ip=observed_ip,
+                    exit_country=new_country,
+                    status_code=200,
+                )
+                profile_report = diagnose_fingerprint(self._fingerprint, engine_type="protocol")
+                checks = dict(profile_report["checks"])
+                checks.update(exit_report["checks"])
+                self._environment_observer({
+                    "kind": "protocol_environment",
+                    "stage": "preflight.exit_rebind",
+                    "rebound_from": expected_ip,
+                    "expected": {
+                        "exit_ip": observed_ip,
+                        "country_code": expected_country,
+                        "fingerprint_id": self._fingerprint.get("fingerprint_id", ""),
+                    },
+                    "observed": {
+                        "exit_ip": observed_ip,
+                        "exit_country": new_country,
+                        "status_code": 200,
+                    },
+                    "fingerprint": profile_report,
+                    "network": exit_report,
+                    "checks": checks,
+                    "all_passed": all(checks.values()),
+                })
+            except Exception as observer_error:
+                logger.debug("记录改绑观测失败: %s", redact_probe_error(observer_error))
+        return True
+
+    def _verify_session_exit(self, stage: str) -> bool:
+        """Re-check the frozen egress after replacing the HTTP session."""
+        expected_ip = str(self._environment.get("exit_ip") or "").strip()
+        if not expected_ip:
+            return True
+        try:
+            response = self.session.get(
+                "https://cloudflare.com/cdn-cgi/trace",
+                timeout=15,
+            )
+            loc = re.search(r"loc=(\w+)", response.text or "")
+            ip = re.search(r"ip=([^\n]+)", response.text or "")
+            observed_country = (loc.group(1) if loc else "").strip().upper()
+            observed_ip = (ip.group(1) if ip else "").strip()
+            report = compare_exit_observation(
+                self._environment,
+                exit_ip=observed_ip,
+                exit_country=observed_country,
+                status_code=response.status_code,
+            )
+            if self._environment_observer:
+                try:
+                    self._environment_observer({
+                        "kind": "protocol_runtime",
+                        "stage": stage,
+                        "network": report,
+                        "checks": report["checks"],
+                        "all_passed": report["all_passed"],
+                    })
+                except Exception as observer_error:
+                    logger.debug(
+                        "记录运行时出口失败: %s",
+                        redact_probe_error(observer_error),
+                    )
+            if not report["all_passed"]:
+                self._network_preflight_error = redact_probe_error(
+                    f"{stage} 后任务出口 IP 发生变化: "
+                    f"expected={expected_ip}, observed={observed_ip or 'N/A'}"
+                )
+                logger.error("网络检查失败: %s", self._network_preflight_error)
+                return False
+            return True
+        except Exception as exc:
+            self._network_preflight_error = redact_probe_error(
+                f"{stage} 后出口复核失败: {exc}"
+            ) or "运行时出口复核失败"
+            logger.error("网络检查失败: %s", self._network_preflight_error)
+            return False
+
+    @staticmethod
+    def _datadog_trace_headers() -> dict:
+        """生成 Datadog RUM 追踪头（对齐 gptfree-register 格式）。"""
+        tid = f"{random.getrandbits(64):016x}"
+        sid = str(random.getrandbits(63))
+        pid = str(random.getrandbits(63))
+        ts_hex = f"{int(time.time()):08x}"
+        return {
+            "traceparent": f"00-0000000000000000{tid}-{random.getrandbits(64):016x}-01",
+            "x-datadog-trace-id": sid,
+            "x-datadog-parent-id": pid,
+            "x-datadog-sampling-priority": "1",
+            "x-datadog-origin": "rum",
+            "x-datadog-tags": f"_dd.p.id={tid},_dd.p.tid={ts_hex}00000000,_dd.b.sr=1",
+        }
+
+    def _common_headers(self, referer: str = "https://chatgpt.com/") -> dict:
+        """
+        构造通用请求头。
+
+        关键点：
+        - Origin 必须与 Referer 同源（尤其 auth.openai.com 的状态机接口），
+          否则容易触发 invalid_state / 风控分支。
+        - 在 auth.openai.com 域下，尽量补充 oai-device-id，提升状态机连续性。
+        - 全请求注入 Datadog trace 头，避免 OTP silent-drop。
+        """
+        origin = "https://chatgpt.com"
+        try:
+            parsed = urlparse(referer or "")
+            if parsed.scheme and parsed.netloc:
+                origin = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            pass
+
+        fp = self._fingerprint
+        profile = header_profile(fp, kind="fetch")
+        headers = {
+            "Accept": "application/json",
+            "Referer": referer,
+            "Origin": origin,
+            "User-Agent": self._ua,
+            "Accept-Language": fp["lang_full"],
+            "Accept-Encoding": profile["accept_encoding"],
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        if profile["priority"]:
+            headers["priority"] = profile["priority"]
+        if fp.get("sec_ch_ua"):
+            headers["sec-ch-ua"] = fp["sec_ch_ua"]
+            headers["sec-ch-ua-mobile"] = fp.get("sec_ch_ua_mobile") or "?0"
+            headers["sec-ch-ua-platform"] = fp["sec_ch_ua_platform"]
+            # Client Hints 全套（仅 Chromium 有值，其他浏览器为空串不下发）
+            if fp.get("sec_ch_ua_full_version_list"):
+                headers["sec-ch-ua-full-version-list"] = fp["sec_ch_ua_full_version_list"]
+            if fp.get("sec_ch_ua_arch"):
+                headers["sec-ch-ua-arch"] = fp["sec_ch_ua_arch"]
+            if fp.get("sec_ch_ua_bitness"):
+                headers["sec-ch-ua-bitness"] = fp["sec_ch_ua_bitness"]
+            if fp.get("sec_ch_ua_model"):
+                headers["sec-ch-ua-model"] = fp["sec_ch_ua_model"]
+            if fp.get("sec_ch_ua_platform_version"):
+                headers["sec-ch-ua-platform-version"] = fp["sec_ch_ua_platform_version"]
+
+        # auth.openai.com 侧请求补设备标识（若可得）
+        try:
+            host = (urlparse(origin).netloc or "").lower()
+        except Exception:
+            host = ""
+        if "auth.openai.com" in host:
+            device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+            if device_id:
+                headers["oai-device-id"] = device_id
+            # 参考实现（GPT-Register-Tool）在 auth 侧请求上带稳定会话 id，
+            # 与 authorize 载荷里的 auth_session_logging_id 同源。
+            session_logging_id = (
+                getattr(self, "_auth_session_logging_id", "")
+                or getattr(self, "_client_auth_session_id", "")
+                or str(uuid.uuid4())
+            )
+            headers["oai-session-id"] = session_logging_id
+        if "chatgpt.com" in host:
+            # 参考实现的 chatgpt_headers：带当前 Web 客户端构建号，纯 Bearer
+            # 冷请求没有这两个头，容易被当成非浏览器客户端。
+            headers["oai-client-build-number"] = "8370486"
+            headers["oai-client-version"] = (
+                "prod-fb4a8a2a751dfec391053cfd7b01c52699ccf78c"
+            )
+
+        headers.update(self._datadog_trace_headers())
+        return headers
+
+    def _navigation_headers(self) -> dict:
+        """文档导航请求（地址栏直达那种）的头，含 client hints。
+
+        和 _common_headers 的区别只在 Sec-Fetch-* 那组：那边是 XHR（empty/cors/
+        same-origin），这里是整页导航（document/navigate/none + user + UIR）。
+        **client hints 两边必须一致**，都从 self._fingerprint 取：Chrome 指纹发
+        全套，Safari/Firefox 指纹 sec_ch_ua 为空串、一个都不发——这正是真实浏览器
+        的行为。旧 warmup 手搓头漏了这段，导致 Chrome UA 裸奔，实测 403 率 4/5，
+        补齐后 5/5 通过（详见 warmup docstring）。
+        """
+        fp = self._fingerprint
+        profile = header_profile(fp, kind="document")
+        headers = {
+            "accept": profile["accept"],
+            "Accept-Language": fp["lang_full"],
+            "Accept-Encoding": profile["accept_encoding"],
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "sec-fetch-user": "?1",
+            "upgrade-insecure-requests": "1",
+            "User-Agent": self._ua,
+        }
+        if profile["priority"]:
+            headers["priority"] = profile["priority"]
+        if fp.get("sec_ch_ua"):
+            headers["sec-ch-ua"] = fp["sec_ch_ua"]
+            headers["sec-ch-ua-mobile"] = fp.get("sec_ch_ua_mobile") or "?0"
+            headers["sec-ch-ua-platform"] = fp["sec_ch_ua_platform"]
+            for key, name in (
+                ("sec_ch_ua_full_version_list", "sec-ch-ua-full-version-list"),
+                ("sec_ch_ua_arch", "sec-ch-ua-arch"),
+                ("sec_ch_ua_bitness", "sec-ch-ua-bitness"),
+                ("sec_ch_ua_model", "sec-ch-ua-model"),
+                ("sec_ch_ua_platform_version", "sec-ch-ua-platform-version"),
+            ):
+                if fp.get(key):
+                    headers[name] = fp[key]
+        return headers
+
+    def warmup(self) -> bool:
+        """GET chatgpt.com 种全套 cookie（含 oai-did），成功返回 True。
+
+        为什么这步不能失败（2026-08-10 实测 26 轮，跨 40+ 出口 IP）：
+        `POST /api/auth/signin/openai` 依据 chatgpt.com 的 cookie 决定返回什么——
+        有 oai-did 就返 auth.openai.com/authorize URL，没有就返 NextAuth 页，
+        后者到 authorize/continue 必然 409 invalid_state。
+        实测：无 oai-did 的 5 轮 **5/5 全 409**；有 oai-did 的 17 轮只有 3 次 409。
+
+        旧实现两个问题，实测各占一半失败：
+        1. 单次无重试 + timeout=15。实测种 cookie 失败率 19%，形态有三种：
+           TLS curl(35) 断连、15s 超时、CF 403。成功轮实际耗时 3.4~10.9s，
+           15s 卡边缘，40s 才有富余。
+        2. **返回值和实际结果对不上**：只 catch 异常，不看 status_code——
+           403 照样 return True（实测 3 轮 True 但没 cookie），
+           而超时前 cookie 其实已经种上了却 return False（实测 1 轮）。
+           所以判据改成直接查 cookie jar，这是唯一可信的信号。
+
+        3. **没发 client hints，自称 Chrome 却不带 sec-ch-ua —— CF 一眼假。**
+           这是 403 的真因。真 Chrome 每个导航请求必带 sec-ch-ua/-mobile/-platform，
+           而旧 warmup 是手搓 headers、一个都没带（_common_headers 带了，只有这里漏）。
+           2026-08-10 实测，同一 impersonate 各打 5 次（每次新 IP）：
+
+               impersonate   裸头(旧)   补 CH 全套
+               chrome146      1/5        5/5
+               chrome136      1/5        5/5
+               chrome142      4/5        4/5   ← 唯一失败是 SSL 断连，不是 403
+
+           补齐后 403 **全部消失**。此前"chrome 族被 CF 拦"的结论是误判：
+           safari/firefox 当时 4/4 不是因为它们更干净，而是**它们本来就不该发
+           client hints**，裸头对它们恰好是正确的头。所以修法是把头补齐，
+           不是换成 safari —— 换指纹只是绕开症状，且会让 self._fingerprint 与
+           self._ua 不一致（后续 _common_headers 会拿旧家族的 CH 配新 UA，更假）。
+
+        重试只换出口 IP，不换指纹（指纹本来就没问题，见上）：代理池按会话分配
+        出口，新 session ≈ 新 IP，绕开连不上的坏 IP。cookie 跟着 session 一起
+        清掉是对的：失败轮本来就没种到有用的东西。
+
+        注：URL 保持首页 `/`。实测对比过 `/auth/login`（16 轮 vs 10 轮），
+        失败率 18.75% vs 20%，无差异，不值得换。
+
+        【最终验证 2026-08-10】本处 + auth_oauth_init + _follow_redirects 三处
+        统一走 _navigation_headers 后，用真实 CF 域名跑完整 run_register
+        **3/3 全成功**（各约 100s，password + access_token 齐全），409 = 0。
+        """
+        headers = self._navigation_headers()
+        # 真人节奏：点开链接到页面真正发出请求之间总有一点停顿（等页面渲染/输地址）。
+        self._human_pause(0.8, 2.2)
+
+        for attempt in range(6):
+            if attempt:
+                # 只换出口 IP（新 session = 新出口），指纹保持不变：
+                # 403 是缺 client hints 导致的，已在头里修好，不是指纹的锅。
+                time.sleep(3 + attempt * 2)
+                self.session = create_http_session(
+                    proxy=self.config.proxy,
+                    impersonate=self._impersonate_candidates[self._impersonate_idx],
+                    user_agent=self._ua,
+                )
+                if not self._verify_session_exit("warmup.retry"):
+                    return False
+            try:
+                # 流量优化（2026-09-29 实测）：GET /api/auth/session 只有 ~241B 且
+                # 同样会种 oai-did + __cf_bm（首页 ~358KB）。轻量路径优先，
+                # 没种上再回退首页 —— 平均每号省 ~350KB，warmup 判定逻辑不变。
+                resp = self.session.get(
+                    "https://chatgpt.com/api/auth/session", headers=headers, timeout=40,
+                )
+                status = resp.status_code
+            except Exception as e:
+                status = None
+                logger.warning(f"warmup 第 {attempt + 1}/6 次请求失败: {e}")
+            try:
+                cookies = self.session.cookies.get_dict()
+            except Exception:
+                cookies = {}
+            if "oai-did" not in cookies:
+                # 轻量路径没种上 → 用首页兜底确认一次（避免把轻量路径偶发问题误判成出口不可用）
+                try:
+                    resp = self.session.get(
+                        "https://chatgpt.com", headers=headers, timeout=40,
+                    )
+                    status = resp.status_code
+                except Exception as e:
+                    status = None
+                    logger.warning(f"warmup 第 {attempt + 1}/6 次首页兜底失败: {e}")
+                try:
+                    cookies = self.session.cookies.get_dict()
+                except Exception:
+                    cookies = {}
+
+            # 唯一判据：cookie 到底种上没有。HTTP 200 不代表拿到 oai-did（CF 403 只给
+            # __cf_bm），请求抛异常也不代表没拿到（超时前可能已经种上了）。
+            if "oai-did" in cookies:
+                logger.info(
+                    f"chatgpt.com warmup 完成（第 {attempt + 1} 次，oai-did 已种，"
+                    f"共 {len(cookies)} 个 cookie）"
+                )
+                return True
+
+            logger.warning(
+                f"warmup 第 {attempt + 1}/6 次未种到 oai-did"
+                + (f"（HTTP {status}）" if status is not None else "")
+                + (f"，已有 cookie: {sorted(cookies)}" if cookies else "，无任何 cookie")
+            )
+
+        logger.error("warmup 6 次均未种到 oai-did cookie；当前会话初始化未完成")
+        return False
+
+    # ── Step 1: 检查代理连通性 ──
+    def check_proxy(self) -> bool:
+        self._network_preflight_error = ""
+        logger.info("检查网络连通性...")
+        try:
+            # 5000 条代理池里混着少量劣质出口：一次 curl(28) 超时就判整个任务
+            # 失败太亏（号已 claim、环境已预留）。最多重试 3 次，只有连续失败
+            # 才把异常交给下面的 except 处理。
+            resp = None
+            last_exc: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    resp = self.session.get(
+                        "https://cloudflare.com/cdn-cgi/trace", timeout=15
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    logger.warning(
+                        "网络连通性探测失败（第 %d/3 次）: %s",
+                        attempt,
+                        # 统一走脱敏，异常里可能带 token/password 之类的凭证
+                        redact_probe_error(exc)[:140],
+                    )
+                    if attempt < 3:
+                        time.sleep(1.5 * attempt)
+            if resp is None and last_exc is not None:
+                raise last_exc
+            if resp.status_code == 200:
+                loc = re.search(r"loc=(\w+)", resp.text)
+                ip = re.search(r"ip=([^\n]+)", resp.text)
+                country_code = (loc.group(1) if loc else "").strip().upper()
+                exit_ip = (ip.group(1) if ip else "").strip()
+                expected_ip = str(self._environment.get("exit_ip") or "").strip()
+                expected_country = str(
+                    self._environment.get("country_code")
+                    or self._fingerprint.get("country_code")
+                    or self._country_code
+                ).strip().upper()
+                exit_report = compare_exit_observation(
+                    self._environment,
+                    exit_ip=exit_ip,
+                    exit_country=country_code,
+                    status_code=resp.status_code,
+                )
+                profile_report = diagnose_fingerprint(
+                    self._fingerprint,
+                    engine_type="protocol",
+                )
+                checks = dict(profile_report["checks"])
+                checks.update(exit_report["checks"])
+                observation = {
+                    "kind": "protocol_environment",
+                    "expected": {
+                        "exit_ip": expected_ip,
+                        "country_code": expected_country,
+                        "fingerprint_id": self._fingerprint.get("fingerprint_id", ""),
+                    },
+                    "observed": {
+                        "exit_ip": exit_ip,
+                        "exit_country": country_code,
+                        "status_code": resp.status_code,
+                    },
+                    "fingerprint": profile_report,
+                    "network": exit_report,
+                    "checks": checks,
+                    "all_passed": all(checks.values()),
+                }
+                try:
+                    if self._environment_observer:
+                        self._environment_observer(observation)
+                except Exception as observer_error:
+                    logger.debug("记录运行时环境观测失败: %s", redact_probe_error(observer_error))
+
+                # 画像在任务初始化时已经冻结。这里仅记录出口国家，不能在请求中途
+                # 重建画像，否则 UA、Accept-Language、时区和 TLS 会来自两套环境。
+                if country_code and expected_country and country_code != expected_country:
+                    logger.warning(
+                        "代理国家与任务画像不一致: proxy=%s fingerprint=%s；保留已冻结画像",
+                        country_code,
+                        expected_country,
+                    )
+                if expected_ip and not exit_report["checks"]["exit_ip_matches"]:
+                    # Some rotating proxy sessions return a neighbouring exit IP
+                    # between allocation and the first request. Probe once more
+                    # before rejecting the whole account; a reachable, stable
+                    # replacement is still the same usable network path.
+                    logger.warning(
+                        "任务出口 IP 发生变化，执行一次复核: expected=%s observed=%s",
+                        expected_ip,
+                        exit_ip or "N/A",
+                    )
+                    try:
+                        retry = self.session.get(
+                            "https://cloudflare.com/cdn-cgi/trace",
+                            timeout=15,
+                        )
+                        retry_ip_match = re.search(r"ip=([^\n]+)", retry.text or "")
+                        retry_ip = (retry_ip_match.group(1) if retry_ip_match else "").strip()
+                        retry_loc_match = re.search(r"loc=(\w+)", retry.text or "")
+                        retry_country = (retry_loc_match.group(1) if retry_loc_match else "").strip().upper()
+                        retry_report = compare_exit_observation(
+                            self._environment,
+                            exit_ip=retry_ip,
+                            exit_country=retry_country,
+                            status_code=retry.status_code,
+                        )
+                        if retry.status_code == 200 and retry_ip and retry_ip != expected_ip:
+                            logger.warning(
+                                "代理出口 IP 复核仍不匹配: %s -> %s",
+                                expected_ip,
+                                retry_ip,
+                            )
+                            # 两次探测都是同一个「新」出口（retry_ip == exit_ip）说明这是
+                            # 一条稳定路径，只是厂商把粘性会话重分配了。此时还没对 OpenAI
+                            # 发过请求，改绑比整单作废划算；出口一直在变（两个值不同）
+                            # 才真是坏链路，不做改绑。
+                            rebound = retry_ip == exit_ip and self._rebind_exit_after_drift(
+                                expected_ip, retry_ip, retry_country
+                            )
+                            if not rebound:
+                                self._network_preflight_error = redact_probe_error(
+                                    f"任务出口 IP 持续变化: expected={expected_ip}, observed={retry_ip}"
+                                )
+                                logger.error("网络检查失败: %s", self._network_preflight_error)
+                                return False
+                        elif not retry_report["checks"].get("exit_ip_matches", False):
+                            self._network_preflight_error = redact_probe_error(
+                                f"任务出口 IP 持续变化: expected={expected_ip}, observed={retry_ip or exit_ip or 'N/A'}"
+                            )
+                            logger.error("网络检查失败: %s", self._network_preflight_error)
+                            return False
+                    except Exception as retry_error:
+                        self._network_preflight_error = redact_probe_error(
+                            f"任务出口 IP 复核失败: {retry_error}"
+                        ) or "任务出口 IP 复核失败"
+                        logger.error("网络检查失败: %s", self._network_preflight_error)
+                        return False
+                logger.info(
+                    "网络正常 - IP: %s, 地区: %s (画像国家: %s)",
+                    exit_ip or "N/A",
+                    country_code or "N/A",
+                    expected_country or "N/A",
+                )
+                if country_code and not self._country_code:
+                    logger.info(
+                        "代理国家=%s（任务未指定国家，画像已按启动前可用信息生成）",
+                        country_code,
+                    )
+                return True
+            else:
+                self._network_preflight_error = f"网络探测异常: cloudflare trace HTTP {resp.status_code}"
+                logger.warning("%s", self._network_preflight_error)
+                if self._environment_observer:
+                    try:
+                        exit_report = compare_exit_observation(
+                            self._environment,
+                            status_code=resp.status_code,
+                        )
+                        profile_report = diagnose_fingerprint(
+                            self._fingerprint,
+                            engine_type="protocol",
+                        )
+                        checks = dict(profile_report["checks"])
+                        checks.update(exit_report["checks"])
+                        self._environment_observer({
+                            "kind": "protocol_environment",
+                            "fingerprint": profile_report,
+                            "network": exit_report,
+                            "checks": checks,
+                            "all_passed": False,
+                        })
+                    except Exception as observer_error:
+                        logger.debug("记录协议环境失败观测失败: %s", redact_probe_error(observer_error))
+            return False
+        except Exception as e:
+            self._network_preflight_error = redact_probe_error(e) or "网络探测异常"
+            logger.error("网络检查失败: %s", self._network_preflight_error)
+            if self._environment_observer:
+                try:
+                    exit_report = compare_exit_observation(self._environment, status_code=None)
+                    exit_report["checks"]["trace_reachable"] = False
+                    exit_report["all_passed"] = False
+                    profile_report = diagnose_fingerprint(
+                        self._fingerprint,
+                        engine_type="protocol",
+                    )
+                    checks = dict(profile_report["checks"])
+                    checks.update(exit_report["checks"])
+                    self._environment_observer({
+                        "kind": "protocol_environment",
+                        "error": self._network_preflight_error,
+                        "fingerprint": profile_report,
+                        "network": exit_report,
+                        "checks": checks,
+                        "all_passed": False,
+                    })
+                except Exception as observer_error:
+                    logger.debug("记录协议环境异常观测失败: %s", redact_probe_error(observer_error))
+        return False
+
+    # ── Step 2: 获取 CSRF Token ──
+    def get_csrf_token(self) -> str:
+        # 真人从页面打开到它自己发出 csrf 请求之间隔着一次渲染，这里补上。
+        # 这段以前是 [csrf → auth_url → oauth_init → sentinel] 四个请求零间隔连发，
+        # 是链路里最密集的一段。
+        self._human_pause(0.15, 0.6)
+        logger.info("[1/10] 获取 CSRF Token...")
+        headers = self._common_headers("https://chatgpt.com/auth/login")
+
+        # Cloudflare 可能在短时间内多次请求后返回 403，重试 3 次
+        for attempt in range(3):
+            try:
+                resp = self.session.get(
+                    "https://chatgpt.com/api/auth/csrf",
+                    headers=headers,
+                    timeout=30,
+                )
+            except Exception as e:
+                if self._is_tls_error(e) and self._rotate_impersonate_session():
+                    continue
+                if self._is_tls_error(e):
+                    raise RuntimeError(
+                        "chatgpt.com TLS 握手失败，当前网络无法建立到 /api/auth/csrf 的 HTTPS 连接。"
+                        "请切换可直连 chatgpt.com 的网络或在界面中配置可用代理后重试。"
+                    ) from e
+                raise
+            if resp.status_code == 403 and attempt < 2:
+                wait = (attempt + 1) * 5
+                logger.warning(f"Cloudflare 403, {wait}s 后重试 ({attempt + 1}/3)...")
+                import time
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
+
+        self._trace_http("chatgpt_csrf", resp)
+        csrf = resp.json().get("csrfToken", "")
+        if not csrf:
+            raise RuntimeError("CSRF Token 获取失败")
+        self.result.csrf_token = csrf
+        logger.debug(f"CSRF Token: {csrf[:20]}...")
+        return csrf
+
+    # ── Step 3: 获取 auth URL ──
+    def get_auth_url(self, csrf_token: str, email: str = "") -> str:
+        self._human_pause(0.2, 0.8)
+        logger.info("[2/10] 获取 OpenAI 授权地址...")
+        headers = self._common_headers("https://chatgpt.com/auth/login")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if not self.result.device_id:
+            self.result.device_id = str(uuid.uuid4())
+        self._auth_session_logging_id = str(uuid.uuid4())
+        query_params: dict[str, str] = {
+            "prompt": "login",
+            "screen_hint": "login_or_signup",
+            "ext-oai-did": self.result.device_id,
+            "auth_session_logging_id": self._auth_session_logging_id,
+            "ext-passkey-client-capabilities": "1111",
+        }
+        if email:
+            query_params["login_hint"] = email
+        signin_url = f"https://chatgpt.com/api/auth/signin/openai?{urlencode(query_params)}"
+        resp = self.session.post(
+            signin_url,
+            headers=headers,
+            data={
+                "csrfToken": csrf_token,
+                "callbackUrl": "https://chatgpt.com/",
+                "json": "true",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        self._trace_http("chatgpt_signin_openai", resp)
+        auth_url = resp.json().get("url", "")
+        if not auth_url:
+            raise RuntimeError("Auth URL 获取失败")
+        # 记住 OAuth 参数，并根据开关可选注入 PKCE
+        self._remember_oauth_params(auth_url)
+        auth_url = self._inject_pkce_into_auth_url(auth_url)
+        self._remember_oauth_params(auth_url)
+        logger.debug(f"Auth URL: {auth_url[:80]}...")
+        return auth_url
+
+    # ── Step 4: OAuth 初始化 & 获取 device_id ──
+    def auth_oauth_init(self, auth_url: str) -> str:
+        """跟随 authorize 链，落 authorize 会话状态并取回 oai-did。
+
+        这一步**建立的就是后面 authorize/continue 要用的那个 state**，头不像真
+        浏览器就拿不到有效状态，下一步必 409 invalid_state。
+
+        旧实现只发 Accept/Referer/UA，缺 client hints、**整组 Sec-Fetch-* 也没有**
+        （真浏览器跳转必带 document/navigate/cross-site）。2026-08-10 实测 A/B
+        对照各 6 轮（400 invalid_username 视为会话正常，只是 .test 域名被拒）：
+
+            A 现状裸头        会话正常 2/6，**409 = 3**
+            B 补齐 CH+SecFetch 会话正常 5/6，**409 = 0**
+
+        和 warmup 那处是同一个病（详见 warmup docstring），当时只修了 warmup，
+        漏了这里，所以主人实跑仍 409。头统一从 _navigation_headers 派生，
+        保证 client hints 与 self._fingerprint / self._ua 同族。
+        """
+        self._human_pause(0.25, 1.0)
+        logger.info("[3/10] OAuth 初始化...")
+        headers = self._navigation_headers()
+        headers["Referer"] = "https://chatgpt.com/"
+        # chatgpt.com -> auth.openai.com 是跨站跳转，不是首次直达
+        headers["sec-fetch-site"] = "cross-site"
+        # 302 自动跟随不是用户手动点击，真浏览器此时不发 sec-fetch-user
+        headers.pop("sec-fetch-user", None)
+        last_error = None
+        resp = None
+        for attempt in range(5):
+            try:
+                resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
+                break
+            except Exception as exc:
+                last_error = exc
+                logger.warning("OAuth 初始化失败，第 %s/5 次重试: %s", attempt + 1, exc)
+                if attempt < 4:
+                    # Connection resets are often transient on rotating exits;
+                    # refresh the session before retrying so stale TLS state is not reused.
+                    time.sleep(1.5 * (attempt + 1))
+                    self.session = create_http_session(
+                        proxy=self.config.proxy,
+                        impersonate=self._impersonate_candidates[self._impersonate_idx],
+                        user_agent=self._ua,
+                    )
+                    if not self._verify_session_exit("oauth_init.retry"):
+                        logger.warning("OAuth 初始化重试出口复核失败，继续尝试下一次")
+        if resp is None:
+            raise last_error or RuntimeError("OAuth 初始化失败")
+        self._trace_http("auth_oauth_init", resp)
+
+        # 从 cookie 获取 oai-did
+        device_id = ""
+        for cookie in self.session.cookies:
+            if hasattr(cookie, "name"):
+                if cookie.name == "oai-did":
+                    device_id = cookie.value
+                    break
+            elif isinstance(cookie, str) and cookie == "oai-did":
+                device_id = self.session.cookies.get("oai-did", "")
+                break
+
+        # curl_cffi cookies 访问方式
+        if not device_id:
+            try:
+                device_id = self.session.cookies.get("oai-did", "")
+            except Exception:
+                pass
+
+        # fallback: 从 HTML 提取
+        if not device_id:
+            m = re.search(r'oai-did["\s:=]+([a-f0-9-]{36})', resp.text)
+            if m:
+                device_id = m.group(1)
+
+        if not device_id:
+            device_id = str(uuid.uuid4())
+            logger.warning(f"未从响应中获取 device_id，使用生成值: {device_id}")
+
+        self.result.device_id = device_id
+        logger.debug(f"Device ID: {device_id}")
+        return device_id
+
+    # ── Step 5: 获取 Sentinel Token ──
+    def _sentinel_fp_kwargs(self) -> dict:
+        """从 self._fingerprint 抽出 sentinel 需要的指纹/硬件字段。
+
+        保证 4 处 sentinel 调用（authorize_continue / username_password_create /
+        create_account 等）用的是同一套一致画像——UA↔platform↔vendor↔硬件全程不变。
+        """
+        fp = self._fingerprint or {}
+        out = {
+            "user_agent": self._ua,
+            "sec_ch_ua": fp.get("sec_ch_ua", ""),
+            "sec_ch_ua_platform": fp.get("sec_ch_ua_platform", ""),
+            "sec_ch_ua_mobile": fp.get("sec_ch_ua_mobile", ""),
+            # Client Hints 全套（仅 Chromium 有值）
+            "sec_ch_ua_full_version_list": fp.get("sec_ch_ua_full_version_list", ""),
+            "sec_ch_ua_arch": fp.get("sec_ch_ua_arch", ""),
+            "sec_ch_ua_bitness": fp.get("sec_ch_ua_bitness", ""),
+            "sec_ch_ua_model": fp.get("sec_ch_ua_model", ""),
+            "sec_ch_ua_platform_version": fp.get("sec_ch_ua_platform_version", ""),
+            "screen": fp.get("screen", ""),
+            "lang": fp.get("lang", ""),
+            "lang_full": fp.get("lang_full", ""),
+            "browser_type": fp.get("browser_type", ""),
+            "navigator_platform": fp.get("navigator_platform", ""),
+            "navigator_vendor": fp.get("navigator_vendor"),
+            "hardware_concurrency": fp.get("hardware_concurrency", 0),
+            "device_memory": fp.get("device_memory"),
+            "max_touch_points": fp.get("max_touch_points", 0),
+            "device_pixel_ratio": fp.get("device_pixel_ratio", 0.0),
+            "timezone": fp.get("timezone", ""),  # IP 联动时区
+        }
+        # 每号设备画像：同一账号在重试/重登时也拿同一套读数，不同账号不同，
+        # 取代此前"全批共享一套硬编码机器"的聚类信号。
+        device_id = (
+            (self.result.device_id or "").strip()
+            or (self.session.cookies.get("oai-did", "") or "").strip()
+        )
+        if device_id:
+            # 传指纹：Sentinel 读数必须跟协议层同一台 Mac（屏幕/核心/GPU/DPR 同源）
+            sil = device_silhouette(device_id, self._fingerprint)
+            out["screen"] = sil["screen"]
+            out["hardware_concurrency"] = sil["hardware_concurrency"]
+            out["device_memory"] = sil["device_memory"]
+            out["device_pixel_ratio"] = sil["device_pixel_ratio"]
+            out["js_heap_size_limit"] = sil["js_heap_size_limit"]
+            out["time_origin"] = sil["time_origin"]
+            out["performance_now"] = sil["performance_now"]
+            out["gpu_vendor"] = sil["gpu_vendor"]
+            out["gpu_renderer"] = sil["gpu_renderer"]
+        return out
+
+    def get_sentinel_token(self, device_id: str) -> str:
+        # 真实浏览器里 PoW 是页面 JS 触发的，从"页面就绪"到"开始算"之间也有间隔
+        self._human_pause(0.2, 0.9)
+        logger.info("[4/10] 获取 Sentinel Token (PoW)...")
+        from sentinel import get_sentinel_token
+        result = get_sentinel_token(
+            self.session,
+            device_id=device_id,
+            flow="authorize_continue",
+            **self._sentinel_fp_kwargs(),
+        )
+        token, so_token = result
+        self._last_sentinel_token = token or ""
+        self._last_sentinel_so_token = so_token or ""
+        logger.debug("Sentinel Token 获取成功")
+        return token
+
+    # ── Step 6: 提交注册邮箱 ──
+    def authorize_continue(
+        self,
+        email: str,
+        sentinel_token: str,
+        screen_hint: str = "signup",
+        referer: str = "https://auth.openai.com/create-account",
+        trace_step: str = "",
+    ) -> dict:
+        """调用 /api/accounts/authorize/continue，返回 JSON。"""
+        headers = self._common_headers(referer)
+        headers["Content-Type"] = "application/json"
+        if sentinel_token:
+            headers["openai-sentinel-token"] = sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
+        payload = {
+            "username": {"value": email, "kind": "email"},
+            "screen_hint": screen_hint,
+        }
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/authorize/continue",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        self._trace_http(trace_step or f"authorize_continue_{screen_hint}", resp)
+        if resp.status_code != 200:
+            body = (resp.text or "")[:360]
+            # 额外打日志：headers/req_id 帮排查是不是 IP 风控
+            req_id = (resp.headers.get("x-request-id", "") or "")[:80]
+            ct = (resp.headers.get("Content-Type", "") or "")[:60]
+            logger.error(
+                "authorize/continue 非 200: status=%s screen_hint=%s req_id=%s content_type=%s body=%r",
+                resp.status_code, screen_hint, req_id, ct, body,
+            )
+            def _is_stale_session(response: Any) -> bool:
+                error_text = str(getattr(response, "text", "") or "").lower()
+                return getattr(response, "status_code", 0) == 409 and any(
+                    marker in error_text
+                    for marker in (
+                        "invalid_state",
+                        "sign-in session is no longer valid",
+                        "session is no longer valid",
+                    )
+                )
+
+            # Sentinel work may outlive the authorize session. Rebuild the
+            # complete state-bound chain, returning immediately on any
+            # successful response and reporting the final response on failure.
+            if _is_stale_session(resp):
+                retry_labels = ("retry", "rebuild", "final")
+                for retry_index, retry_label in enumerate(retry_labels):
+                    try:
+                        logger.warning(
+                            "authorize/continue 状态失效，完整重建 OAuth 会话后重试 (%s/%s)",
+                            retry_index + 1, len(retry_labels),
+                        )
+                        if retry_index == len(retry_labels) - 1:
+                            self.session = create_http_session(
+                                proxy=self.config.proxy,
+                                impersonate=self._impersonate_candidates[self._impersonate_idx],
+                                user_agent=self._ua,
+                            )
+                            if not self.warmup():
+                                raise RuntimeError("轮换 HTTP 会话后 warmup 未取得 oai-did")
+                        csrf = self.get_csrf_token()
+                        fresh_url = self.get_auth_url(csrf, email=email)
+                        self.auth_oauth_init(fresh_url)
+                        fresh_token = self.get_sentinel_token(self.result.device_id)
+                        retry_headers = self._common_headers(referer)
+                        retry_headers["Content-Type"] = "application/json"
+                        if fresh_token:
+                            retry_headers["openai-sentinel-token"] = fresh_token
+                        if getattr(self, "_last_sentinel_so_token", ""):
+                            retry_headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
+                        retry_payload = {
+                            "username": {"value": email, "kind": "email"},
+                            "screen_hint": screen_hint,
+                        }
+                        resp = self.session.post(
+                            "https://auth.openai.com/api/accounts/authorize/continue",
+                            headers=retry_headers,
+                            json=retry_payload,
+                            timeout=30,
+                        )
+                        self._trace_http(
+                            trace_step or f"authorize_continue_{screen_hint}_{retry_label}",
+                            resp,
+                        )
+                        if resp.status_code == 200:
+                            return resp.json() if resp is not None else {}
+                        if not _is_stale_session(resp):
+                            break
+                    except Exception as retry_error:
+                        logger.warning("OAuth 会话重建重试失败: %s", retry_error)
+                        break
+
+                body = (getattr(resp, "text", "") or "")[:360]
+                req_id = (getattr(resp, "headers", {}) or {}).get("x-request-id", "")[:80]
+            raise RuntimeError(
+                f"authorize/continue 失败(screen_hint={screen_hint}): "
+                f"HTTP {resp.status_code} req_id={req_id} body={body}"
+            )
+        try:
+            return resp.json() if resp is not None else {}
+        except Exception:
+            return {}
+
+    def signup(self, email: str, sentinel_token: str) -> bool:
+        """提交注册邮箱。返回 True 表示走新注册流程，False 表示已有账号走 OTP 登录流程"""
+        self._human_pause(0.3, 1.2)
+        logger.info("[5/10] 提交注册邮箱...")
+        data = self.authorize_continue(
+            email=email,
+            sentinel_token=sentinel_token,
+            screen_hint="signup",
+            referer="https://auth.openai.com/create-account",
+            trace_step="authorize_continue_signup",
+        )
+
+        # 检测 page_type/continue_url，区分新账号与已有账号
+        try:
+            page = (data.get("page") or {}) if isinstance(data, dict) else {}
+            page_type = (page.get("type") or "").strip()
+            payload = (page.get("payload") or {}) if isinstance(page, dict) else {}
+            continue_url = (data.get("continue_url") or "").strip()
+
+            # 新账号标准分支
+            if page_type == "create_account_password" or "/create-account/password" in continue_url:
+                self._is_existing_account = False
+                self._existing_email_verification_mode = ""
+                self._existing_page_type = page_type
+                logger.info("注册邮箱已提交")
+                return True
+
+            # OTP 验证分支（passwordless 新注册 或 已有账号登录）
+            if page_type == "email_otp_verification":
+                mode = (payload.get("email_verification_mode", "") or "").strip()
+                self._existing_email_verification_mode = mode
+                self._existing_page_type = page_type
+                if mode == "passwordless_signup":
+                    logger.info("服务端选择 passwordless 注册流程（新账号，无密码），等待 OTP")
+                    self._is_existing_account = False
+                else:
+                    logger.info("检测到已有账号，切换到 OTP 登录流程")
+                    self._is_existing_account = True
+                return False
+
+            # 未知 page_type：通常是社交登录/风控分支，按已有账号处理，避免误进 register_password 导致 invalid_state
+            self._existing_email_verification_mode = (payload.get("email_verification_mode", "") or "").strip()
+            self._existing_page_type = page_type
+            self._is_existing_account = True
+            logger.warning(
+                "authorize/continue 返回非标准注册页面: page_type=%s continue_url=%s，按已有账号流程处理",
+                page_type or "(empty)",
+                continue_url[:180] or "(empty)",
+            )
+            return False
+        except Exception:
+            # JSON 解析失败时保守按新注册处理
+            self._is_existing_account = False
+            self._existing_email_verification_mode = ""
+            self._existing_page_type = ""
+            logger.info("注册邮箱已提交")
+            return True
+
+    # ── Step 6.5: 注册密码 ──
+    def register_password(self, email: str) -> bool:
+        self._human_pause(0.25, 1.0)
+        logger.info("[5.5/10] 注册密码...")
+        password = self._random_password()
+
+        # 先访问 create-account/password 页面（HAR 确认需要此步建立服务端状态）
+        try:
+            pw_page = self.session.get(
+                "https://auth.openai.com/create-account/password",
+                headers=self._common_headers("https://auth.openai.com/create-account"),
+                timeout=15,
+            )
+            logger.info(f"create-account/password 页面: {pw_page.status_code}")
+        except Exception as e:
+            logger.warning(f"访问 create-account/password 页面失败: {e}")
+
+        # 注册前需要刷新 sentinel token，且 flow 必须为 username_password_create
+        #
+        # ⚠️ SO token 只在**本次请求**范围内决定带不带，绝不回写实例上的
+        #    _last_sentinel_so_token。原因：send_otp / verify_otp 这些后续步骤
+        #    自己不刷 sentinel，直接复用实例字段。本 flow 服务端不要求 SO token
+        #    （so_token 为空），要是把空值写回实例，等于顺手把后续所有请求的
+        #    SO 头也一起摘掉了 —— 那几步的 flow 服务端是要 SO 的。
+        so_token_for_request = getattr(self, "_last_sentinel_so_token", "")
+        if self.result.device_id:
+            try:
+                from sentinel import get_sentinel_token as _get_st
+                token, so_token = _get_st(self.session, device_id=self.result.device_id,
+                                flow="username_password_create",
+                                **self._sentinel_fp_kwargs())
+                self._last_sentinel_token = token or ""
+                so_token_for_request = so_token or ""
+                if so_token:
+                    self._last_sentinel_so_token = so_token
+                logger.debug("Sentinel Token 获取成功")
+            except Exception as e:
+                # 注：username_password_create 这个 flow 服务端**不下发 so 块**
+                #    （实测 2026-08-06，见 sentinel_quickjs.py 里的说明），
+                #    所以 so_token 为空是正常的，已在 sentinel_quickjs 按服务端要求判定，
+                #    不再走到这个 except。这里只兜网络/子进程一类的真异常。
+                #    走到这里说明用的是上一步的 token，flow 对不上是风控特征，
+                #    但比当场崩掉（POST 根本发不出去）强，故降级继续。
+                logger.warning(
+                    f"注册前刷新 sentinel 失败，将改用 flow 不匹配的现有 sentinel token 提交: {e}"
+                )
+
+        headers = self._common_headers("https://auth.openai.com/create-account/password")
+        headers["Content-Type"] = "application/json"
+        if self._last_sentinel_token:
+            headers["openai-sentinel-token"] = self._last_sentinel_token
+        # 服务端对该 flow 没下发 so 块时 so_token_for_request 为空 → 不带这个头，
+        # 与真实浏览器一致；不要退回实例字段拿别的 flow 的 SO token 来凑。
+        if so_token_for_request:
+            headers["openai-sentinel-so-token"] = so_token_for_request
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/user/register",
+            headers=headers,
+            json={"password": password, "username": email},
+            timeout=30,
+        )
+        self._trace_http("register_password", resp)
+        if resp.status_code != 200:
+            body = re.sub(r"(?i)(password|token|secret)\\s*[:=]\\s*[^,}\\s]+", r"\\1=<redacted>", (resp.text or "")[:300])
+            raise RuntimeError(f"密码注册失败: HTTP {resp.status_code} body={body}")
+        # Only a server-accepted password may be persisted, including by the
+        # worker's exception handler when a later registration step fails.
+        self.result.password = password
+        logger.info("密码注册成功")
+        # ⚠️ 走到这里 = OpenAI 侧账号连同这个密码**已经建好了**，但注册流程后面还有
+        #    发码 → 验证 OTP → create_account 三步，任何一步挂掉都到不了 save_registered。
+        #    密码是这个方法现生成的、只活在内存里，进程一退就永久没了 ——
+        #    号还在 OpenAI 那边好好的，却谁也登不进去（实测 2026-08-07 被 OTP 超时坑过一次）。
+        #    所以在这里立刻回调落盘。
+        #    位置刻意选在 POST 200 **之后**而不是生成密码时：POST 失败的密码
+        #    OpenAI 侧根本没生效，写进库里反而误导人以为能用。
+        if self._on_password is not None:
+            try:
+                self._on_password(email, password)
+            except Exception as e:
+                logger.warning(f"密码落盘回调失败（不影响注册，日志里还有兜底）: {e}")
+        return True
+
+    # ── Step 7: 发送 OTP ──
+    def send_otp(self, referer: str = "https://auth.openai.com/create-account/password"):
+        self._human_pause(0.35, 1.4)
+        logger.info(f"[6/10] 发送 OTP (referer={referer.split('/')[-1]})...")
+        headers = self._common_headers(referer)
+        if self._last_sentinel_token:
+            headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
+        # zhuce6 用 GET /api/accounts/email-otp/send
+        resp = self.session.get(
+            "https://auth.openai.com/api/accounts/email-otp/send",
+            headers=headers,
+            timeout=30,
+        )
+        self._trace_http("send_email_otp", resp)
+        if resp.status_code != 200:
+            raise RuntimeError(f"发送 OTP 失败: {resp.status_code} - {resp.text[:200]}")
+        logger.info("OTP 已发送到邮箱")
+
+    def send_passwordless_otp(self, referer: str = "https://auth.openai.com/create-account/password") -> bool:
+        """
+        走 passwordless 发码（create-account/password 页面可触发该路径）。
+        """
+        headers = self._common_headers(referer)
+        headers["Content-Type"] = "application/json"
+        if self._last_sentinel_token:
+            headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/passwordless/send-otp",
+            headers=headers,
+            timeout=30,
+        )
+        self._trace_http("send_passwordless_otp", resp)
+        if resp.status_code == 200:
+            logger.info("passwordless OTP 已发送")
+            return True
+        logger.warning(f"passwordless 发码失败: {resp.status_code} - {(resp.text or '')[:220]}")
+        return False
+
+    def resend_otp(self, referer: str = "https://auth.openai.com/email-verification") -> bool:
+        """
+        重发 OTP（适用于已有账号 passwordless/login_challenge）。
+        返回 True 代表请求成功。
+        """
+        headers = self._common_headers(referer)
+        headers["Content-Type"] = "application/json"
+        if self._last_sentinel_token:
+            headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/email-otp/resend",
+            headers=headers,
+            timeout=30,
+        )
+        self._trace_http("resend_email_otp", resp)
+        if resp.status_code == 200:
+            logger.info("OTP 已重发")
+            return True
+        logger.warning(f"重发 OTP 失败: {resp.status_code} - {(resp.text or '')[:200]}")
+        return False
+
+    def kickoff_otp_delivery(self, mode: str = "") -> bool:
+        """
+        统一发码策略, 根据 mode hint 区分"新注册" vs "已有账号" referer:
+
+        - 新注册 (create-account/password 页面 state): passwordless/send-otp → email-otp/send
+        - 已有账号 / passwordless_login / existing_*: send_otp(referer=email-verification) → resend_otp
+          (绕开 passwordless/send-otp 在已有账号场景的 409 invalid_state)
+        """
+        mode_lc = (mode or "").strip().lower()
+        is_existing = (
+            "existing" in mode_lc
+            or "passwordless_login" in mode_lc
+            or "passwordless_signup" in mode_lc  # OpenAI 把 outlook 接码池都打这个 mode
+            or self._is_existing_account
+        )
+
+        if is_existing:
+            # 已有账号 passwordless_signup / passwordless_login: authorize/continue 已经在
+            # OpenAI server 端 trigger 了发码 (state S, OTP X, 邮件 X 已在投递). 这里**只能 resend**
+            # (复用同 challenge state, 复用同 OTP X 或派生新码但 state 不变). 不能调 send_otp,
+            # 它会新建 challenge token 让 state 跳到 Y, 旧邮件 X 在 server 端立即失效 → IMAP 抓到 X
+            # verify 时 wrong_email_otp_code.
+            if self.resend_otp("https://auth.openai.com/email-verification"):
+                return True
+            # resend 失败兜底: send_otp 新建 challenge (旧 state 已坏, 不得不重启)
+            logger.warning(f"已有账号 resend 失败, 兜底 send_otp 新建 challenge (邮件 X 将失效)")
+            try:
+                self.send_otp(referer="https://auth.openai.com/email-verification")
+                return True
+            except Exception as e:
+                logger.warning(f"已有账号发码全 fail: {e}")
+                return False
+
+        # 新注册 (原顺序)
+        if self.send_passwordless_otp("https://auth.openai.com/create-account/password"):
+            return True
+        if self.resend_otp("https://auth.openai.com/email-verification"):
+            return True
+        try:
+            self.send_otp()
+            return True
+        except Exception as e:
+            logger.warning(f"send_otp 兜底失败(mode={mode_lc or 'unknown'}): {e}")
+            return False
+
+    def _kickoff_new_registration_otp(self) -> bool:
+        """Send OTP without switching the new-registration challenge state."""
+        try:
+            self.send_otp(
+                referer="https://auth.openai.com/create-account/password"
+            )
+            return True
+        except Exception as exc:
+            logger.warning("新注册 OTP 发送失败: %s", exc)
+            return False
+
+    @staticmethod
+    def _default_password_from_email(email: str) -> str:
+        """⚠️ 这是**猜**出来的密码，不是这个号真的密码。
+
+        只在实在拿不到真密码时用来碰一下运气（碰上早期用这个规则建的号）。
+        调用方必须走 _resolve_login_password，别直接调这个 —— 见那边的注释。
+        """
+        pwd = (email or "").replace("@", "")
+        if len(pwd) < 8:
+            pwd = f"{pwd}2026OpenAI"
+        return pwd
+
+    def _resolve_login_password(self, email: str) -> tuple[str, bool]:
+        """找出登录这个号该用的密码。返回 (密码, 是否为真密码)。
+
+        真密码三个来源，按优先级：
+            ① self.result.password —— 本轮 register_password 刚设的
+            ② LOGIN_PASSWORD 环境变量 —— 主人手动指定
+            ③ account_callback —— 数据库里存的（**重跑老号全靠这条**）
+        三条都空才退到 _default_password_from_email 猜一个，此时第二个返回值 False。
+
+        ⚠️ 猜出来的密码**绝不能**写回 self.result.password。那个字段有两个下游：
+             · to_dict() → registrar 落库，会把假密码存成这个号的密码；
+             · registrar 异常兜底那行「该号已生成密码，请自行留存」。
+           实测：一个 passwordless 老号（从没设过密码）被打成「邮箱去掉 @」，
+           照着存等于存了个死密码。所以赋值一律由调用方按 is_real 决定。
+        """
+        pwd = (self.result.password or "").strip()
+        if pwd:
+            return pwd, True
+        pwd = (os.getenv("LOGIN_PASSWORD", "") or "").strip()
+        if pwd:
+            return pwd, True
+        if self._account_callback:
+            try:
+                cred = self._account_callback(email) or {}
+                pwd = (cred.get("password") or "").strip()
+                if pwd:
+                    logger.info("已从数据库加载密码")
+                    return pwd, True
+            except Exception as e:
+                logger.warning(f"account_callback 加载密码异常: {e}")
+        return self._default_password_from_email(email), False
+
+    @staticmethod
+    def _random_password(length: int = 16) -> str:
+        import string
+        upper = string.ascii_uppercase
+        lower = string.ascii_lowercase
+        digits = string.digits
+        special = "!@#$%^&*"
+        must = [
+            random.choice(upper),
+            random.choice(lower),
+            random.choice(digits),
+            random.choice(special),
+        ]
+        all_chars = upper + lower + digits + special
+        rest = random.choices(all_chars, k=length - len(must))
+        pwd_list = must + rest
+        random.shuffle(pwd_list)
+        return "".join(pwd_list)
+
+    def login_password_verify(self, password: str) -> dict:
+        """已有账号密码登录一步（/password/verify）。"""
+        headers = self._common_headers("https://auth.openai.com/log-in/password")
+        headers["Content-Type"] = "application/json"
+        if self._last_sentinel_token:
+            headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/password/verify",
+            headers=headers,
+            json={"password": password},
+            timeout=30,
+        )
+        self._trace_http("login_password_verify", resp)
+        if resp.status_code != 200:
+            body = (resp.text or "")[:260]
+            raise RuntimeError(f"密码登录失败: {resp.status_code} - {body}")
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+
+    # ── Step 7.5: 提交 TOTP 2FA 验证码 ──
+    def submit_mfa_totp(self, totp_code: str, challenge_id: str) -> dict:
+        """提交 TOTP 2FA 验证码（已有账号登录时，密码验证后进入 mfa-challenge 状态）。
+
+        Args:
+            totp_code: 6 位 TOTP 动态码
+            challenge_id: 从 continue_url 提取的 challenge ID（如 /mfa-challenge/6a76f2e8...）
+
+        Returns:
+            服务端响应 dict，包含 continue_url 指向 callback
+        """
+        headers = self._common_headers("https://auth.openai.com/mfa-challenge")
+        headers["Content-Type"] = "application/json"
+        if self._last_sentinel_token:
+            headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
+
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/mfa/verify",
+            headers=headers,
+            json={"code": totp_code, "type": "totp", "id": challenge_id},
+            timeout=30,
+        )
+        self._trace_http("submit_mfa_totp", resp)
+        if resp.status_code != 200:
+            body = (resp.text or "")[:260]
+            raise RuntimeError(f"TOTP 验证失败: {resp.status_code} - {body}")
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+
+    # ── Step 8: 验证 OTP ──
+    def verify_otp(self, otp_code: str) -> dict:
+        self._human_pause(0.4, 1.6)
+        logger.info("[7/10] 验证 OTP...")
+        headers = self._common_headers("https://auth.openai.com/email-verification")
+        headers["Content-Type"] = "application/json"
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/email-otp/validate",
+            headers=headers,
+            json={"code": otp_code},
+            timeout=30,
+        )
+        self._trace_http("validate_email_otp", resp)
+        if resp.status_code != 200:
+            body = (resp.text or "")
+            logger.warning(f"verify_otp FULL body ({resp.status_code}): {body[:2000]}")
+            raise RuntimeError(f"OTP 验证失败: {resp.status_code} - {body[:260]}")
+        logger.info("OTP 验证成功")
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+
+    # ── Step 9: 创建账户 ──
+    def create_account(self) -> str:
+        self._human_pause(0.3, 1.3)
+        logger.info("[8/10] 创建账户...")
+        # 创建账户前刷新 sentinel token，flow 为 create_account
+        if self.result.device_id:
+            try:
+                from sentinel import get_sentinel_token as _get_st
+                token, so_token = _get_st(self.session, device_id=self.result.device_id,
+                                flow="oauth_create_account",
+                                **self._sentinel_fp_kwargs())
+                self._last_sentinel_token = token or ""
+                self._last_sentinel_so_token = so_token or ""
+                logger.debug("Sentinel Token 获取成功")
+            except RuntimeError:
+                raise
+            except Exception as e:
+                logger.warning(f"创建账户前刷新 sentinel 失败: {e}")
+        headers = self._common_headers("https://auth.openai.com/about-you")
+        headers["Content-Type"] = "application/json"
+        if self._last_sentinel_token:
+            headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
+        _FIRST = ["James", "John", "Robert", "Michael", "William", "David", "Richard",
+                  "Joseph", "Thomas", "Charles", "Mary", "Patricia", "Jennifer", "Linda",
+                  "Elizabeth", "Barbara", "Susan", "Jessica", "Sarah", "Karen"]
+        _LAST = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
+                 "Davis", "Rodriguez", "Martinez", "Wilson", "Anderson", "Taylor", "Thomas"]
+        name = f"{random.choice(_FIRST)} {random.choice(_LAST)}"
+        birthdate = f"{random.randint(1985, 2000)}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}"
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/create_account",
+            headers=headers,
+            json={"name": name, "birthdate": birthdate},
+            timeout=30,
+        )
+        self._trace_http("create_account", resp)
+        if resp.status_code != 200:
+            body = (resp.text or "")[:500]
+            logger.error("创建账户失败: http=%s body=%s", resp.status_code, body)
+            raise RuntimeError(f"创建账户失败: {resp.status_code} - {body[:260]}")
+        data = resp.json()
+        continue_url = data.get("continue_url", "")
+        self._sniff_login_verifier(continue_url, "create_account_continue_url")
+        page_type = (self._extract_page_type(data) or "").strip().lower()
+
+        # 部分号被风控升级为 Persona 身份验证：create_account 直接返回
+        # page.type=identity_verification + persona_inquiry。真实页面协议：
+        #   get_inquiry_status -> approved 时 complete_id_verification 推进，
+        #   其余状态只能真人上传证件。
+        # 这里先按协议查询：approved 就直接推进（真实链路，不是绕验证），
+        # 未通过则抛出 IdentityVerificationRequired 让上层终止隔离，不再
+        # 盲目重发 OTP（重发对该步骤只会得到 400 invalid_auth_step）。
+        if page_type == "identity_verification":
+            persona = (
+                (data.get("oai-client-auth-session") or {}).get("persona_inquiry")
+                or {}
+            )
+            inquiry_id = (persona.get("id") or "").strip() if isinstance(persona, dict) else ""
+            status = self._get_identity_verification_status()
+            logger.info("identity_verification 页：persona 状态=%s", status or "unknown")
+            if (status or "").strip().lower() == "approved":
+                complete_resp = self._complete_identity_verification()
+                cont = self._normalize_continue_url(
+                    self._extract_continue_url_from_step(complete_resp)
+                )
+                if cont:
+                    logger.info("Persona 身份验证已通过，complete_id_verification 推进链路")
+                    continue_url = cont
+                else:
+                    logger.warning("complete_id_verification 无 continue_url，沿用原链")
+            else:
+                raise IdentityVerificationRequired(status, inquiry_id)
+
+        # 尝试 workspace select
+        if not continue_url:
+            workspace_id = self._extract_workspace_id()
+            if workspace_id:
+                continue_url = self._workspace_select(workspace_id)
+
+        if not continue_url:
+            raise RuntimeError("创建账户后未获取到 continue_url")
+
+        logger.info("账户创建成功")
+        return continue_url
+
+    def _get_identity_verification_status(self) -> str:
+        """查询 Persona 身份验证状态（VERIFY_YOUR_IDENTITY 页面 clientLoader）。"""
+        headers = self._common_headers("https://auth.openai.com/verify-your-identity")
+        headers["Content-Type"] = "application/json"
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/get_inquiry_status",
+            headers=headers,
+            timeout=30,
+        )
+        self._trace_http("get_inquiry_status", resp)
+        if resp.status_code != 200:
+            raise RuntimeError(f"get_inquiry_status 失败: {resp.status_code}")
+        try:
+            return str((resp.json() or {}).get("status") or "")
+        except Exception:
+            return ""
+
+    def _complete_identity_verification(self) -> dict:
+        """提交已通过的 Persona 身份验证（VERIFY_YOUR_IDENTITY 页面 clientAction）。"""
+        headers = self._common_headers("https://auth.openai.com/verify-your-identity")
+        headers["Content-Type"] = "application/json"
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/complete_id_verification",
+            headers=headers,
+            timeout=30,
+        )
+        self._trace_http("complete_id_verification", resp)
+        if resp.status_code != 200:
+            raise RuntimeError(f"complete_id_verification 失败: {resp.status_code}")
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+
+    def _extract_workspace_id(self) -> str:
+        """从 cookie 中提取 workspace_id"""
+        try:
+            auth_session = self.session.cookies.get("oai-client-auth-session", "")
+            if auth_session:
+                parts = auth_session.split(".")
+                # 兼容不同 cookie 形态：workspace_id 可能在第 1 段/第 2 段，也可能在 workspaces[0].id
+                for idx in range(min(2, len(parts))):
+                    segment = (parts[idx] or "").strip()
+                    if not segment:
+                        continue
+                    payload_b64 = segment + "=" * (-len(segment) % 4)
+                    decoded = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8"))
+                    if not isinstance(decoded, dict):
+                        continue
+                    wid = (decoded.get("workspace_id", "") or "").strip()
+                    if wid:
+                        return wid
+                    workspaces = decoded.get("workspaces", [])
+                    if isinstance(workspaces, list):
+                        for it in workspaces:
+                            if isinstance(it, dict):
+                                wid = (it.get("id", "") or "").strip()
+                                if wid:
+                                    return wid
+        except Exception:
+            pass
+        return ""
+
+    def _workspace_select(self, workspace_id: str) -> str:
+        logger.info("执行 workspace 选择...")
+        headers = self._common_headers("https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
+        headers["Content-Type"] = "application/json"
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/workspace/select",
+            headers=headers,
+            json={"workspace_id": workspace_id},
+            timeout=30,
+        )
+        self._trace_http("workspace_select", resp)
+        return resp.json().get("continue_url", "") if resp.status_code == 200 else ""
+
+    def _choose_account_select(self, html_text: str, current_url: str) -> str:
+        """处理 /choose-an-account 多账号选择页（react-router SSR）。
+
+        HTML 里 streamController.enqueue 注入 `unified_sessions[].id` (us_*) 和
+        `session_id` (authsess_*)。这里 regex 抽 us_*，按 react-router action 惯例
+        POST 回 /choose-an-account，并 fallback 试几个候选 JSON endpoint。
+        返回 next continue_url 或空串。
+        """
+        m = re.search(r"us_[A-Za-z0-9]{16,}", html_text or "")
+        if not m:
+            logger.warning("/choose-an-account HTML 里没找到 us_* session id, 跳过")
+            return ""
+        session_id = m.group(0)
+        logger.debug(f"/choose-an-account 选 session_id={session_id}")
+        headers = self._common_headers("https://auth.openai.com/choose-an-account")
+        headers["Origin"] = "https://auth.openai.com"
+
+        # 真实 endpoint 从 nextStepHandler-*.js 反编译解出：
+        #   const {path, method} = r.data.intent === "select"
+        #     ? {path: "/session/select", method: "POST"}
+        #     : {path: "/session/remove", method: "DELETE"};
+        #   fetch(`${authapi_base}/session/select`, {method, body: JSON.stringify({session_id})})
+        # 即 POST https://auth.openai.com/api/accounts/session/select JSON {session_id}
+        # （intent 决定 path 不进 body；body 只有 session_id 一个字段）
+        # 之前直接 POST /choose-an-account 会先经过 react-router action loader 再被
+        # nextStepHandler 转发，但 server-side 那一段似乎对 CT/form 字段强敏感，500。
+        # 直接命中底层 /api/accounts/session/select 绕开 react-router 层。
+        candidates = [
+            ("POST", "https://auth.openai.com/api/accounts/session/select",
+             {"session_id": session_id}, "json"),
+            # 兜底：万一上面被风控，回退到 react-router 路径 + zod schema 字段
+            ("POST", "https://auth.openai.com/choose-an-account",
+             {"intent": "select", "session_id": session_id}, "form"),
+        ]
+        for method, url, body, kind in candidates:
+            try:
+                h = dict(headers)
+                if kind == "json":
+                    h["Content-Type"] = "application/json"
+                    h["Accept"] = "application/json"
+                    resp = self.session.post(url, headers=h, json=body, timeout=30)
+                else:
+                    h["Content-Type"] = "application/x-www-form-urlencoded"
+                    h["Accept"] = "application/json, text/html;q=0.9"
+                    body_str = "&".join(f"{k}={v}" for k, v in body.items())
+                    resp = self.session.post(url, headers=h, data=body_str, timeout=30)
+                self._trace_http(f"choose_account_try_{kind}_{url.rsplit('/', 1)[-1][:30]}", resp)
+                status = getattr(resp, "status_code", 0)
+                snippet = (getattr(resp, "text", "") or "")[:240].replace("\n", " ")
+                loc = (getattr(resp, "headers", {}) or {}).get("Location", "") or \
+                      (getattr(resp, "headers", {}) or {}).get("location", "") or ""
+                # print 到 stdout 让 webui SSE 能看到每个候选的具体结果
+                print(
+                    f"[choose-an-account] {method} {url} [{kind}] -> "
+                    f"status={status} loc={loc[:120]} body={snippet}",
+                    flush=True,
+                )
+                if status in (200, 201, 302, 303):
+                    next_url = ""
+                    try:
+                        j = resp.json() if resp is not None else {}
+                        next_url = j.get("continue_url", "") if isinstance(j, dict) else ""
+                    except Exception:
+                        pass
+                    if not next_url and loc:
+                        next_url = loc
+                    if next_url:
+                        logger.debug(f"choose-an-account 选号成功 endpoint={url} next={next_url[:120]}")
+                        return next_url
+                    # 200 但没 continue_url：可能 set 了 cookie，直接让 caller 重 GET authorize
+                    if status == 200:
+                        logger.debug(f"choose-an-account POST {url} 200 OK 无 continue_url，假定 cookie 已 set")
+                        return current_url  # 让外层重 GET 一次，cookie 已被 server set
+            except Exception as e:
+                print(f"[choose-an-account] {method} {url} [{kind}] -> EXC {e}", flush=True)
+                continue
+        logger.warning("/choose-an-account 全部候选 endpoint 都失败")
+        return ""
+
+    def _normalize_continue_url(self, continue_url: str) -> str:
+        """
+        标准化 continue_url：
+        1) 相对路径 -> 绝对路径
+        2) workspace 页面 -> 调用 workspace/select 取下一跳
+        """
+        if not continue_url:
+            return ""
+        out = continue_url.strip()
+        if out.startswith("/"):
+            out = urljoin("https://auth.openai.com", out)
+        if "/workspace" in out:
+            workspace_id = self._extract_workspace_id() or self._extract_query_first(out, ["workspace_id", "id"])
+            if workspace_id:
+                logger.info("检测到 workspace 页面，尝试 workspace/select: workspace_id=%s", workspace_id)
+                next_url = self._workspace_select(workspace_id)
+                if next_url:
+                    out = next_url
+        return out
+
+    @staticmethod
+    def _extract_workspace_id_from_html(html_text: str) -> str:
+        """从 workspace 页面 HTML 文本中提取 workspace_id（兜底）。"""
+        if not html_text:
+            return ""
+        try:
+            # 先把转义引号还原，便于正则匹配
+            text = html_text.replace('\\"', '"')
+            patterns = [
+                r'workspaces".{0,1600}?"id","([0-9a-fA-F-]{36})"',
+                r'"workspace_id"\s*:\s*"([0-9a-fA-F-]{36})"',
+                r'"workspaceId"\s*:\s*"([0-9a-fA-F-]{36})"',
+            ]
+            for p in patterns:
+                m = re.search(p, text, flags=re.DOTALL | re.IGNORECASE)
+                if m:
+                    return (m.group(1) or "").strip()
+        except Exception:
+            return ""
+        return ""
+
+    # ── Step 10: 跟踪重定向链 ──
+    def follow_redirect_chain(
+        self,
+        start_url: str,
+        mail_provider=None,
+        email: str = "",
+    ) -> tuple[str, str]:
+        """手动跟踪重定向，返回 (callback_url, final_url)"""
+        logger.info("[9/10] 跟踪重定向链...")
+        current_url = start_url
+        callback_url = ""
+        max_hops = 12
+        referer = "https://auth.openai.com/"
+        email_verification_rounds = 0
+
+        for i in range(max_hops):
+            # Persona 身份验证页（verify-your-identity）：先查状态，approved 才能
+            # 由 complete_id_verification 推进；其余状态直接终止，不重发 OTP。
+            if _looks_like_identity_verification_url(current_url):
+                try:
+                    page_resp = self.session.get(
+                        current_url,
+                        headers=self._navigation_headers(),
+                        timeout=30,
+                        allow_redirects=False,
+                    )
+                    self._trace_http("chain_identity_verify_page", page_resp)
+                    status = self._get_identity_verification_status()
+                    logger.info("identity_verification 页：persona 状态=%s", status or "unknown")
+                    if (status or "").strip().lower() == "approved":
+                        complete_resp = self._complete_identity_verification()
+                        cont = self._normalize_continue_url(
+                            self._extract_continue_url_from_step(complete_resp)
+                        )
+                        if cont:
+                            current_url = cont
+                            continue
+                        logger.warning("complete_id_verification 无 continue_url")
+                    raise IdentityVerificationRequired(status)
+                except IdentityVerificationRequired:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("身份验证页处理失败: %s", exc)
+                break
+
+            # 服务端把当前会话推进到「邮箱再验证」是链路本身的正常一步：
+            # 内联完成 发码→接码→验证，然后从返回的 continue_url 继续追链。
+            # 这不属于兜底；跳过它才是链路缺失。每轮最多补 2 次，防止服务端
+            # 反复要求验证时死循环。
+            if _looks_like_email_verify_url(current_url) and mail_provider is not None:
+                email_addr = (email or self.result.email or "").strip()
+                if email_addr and email_verification_rounds < 2:
+                    email_verification_rounds += 1
+                    logger.info(
+                        "链路进入邮箱验证页（%s），内联完成 发码→接码→验证",
+                        current_url[:120],
+                    )
+                    try:
+                        # 先真正加载该验证页。identity_verification（verify-your-identity）
+                        # 与 passwordless email-otp 是两套状态机，页面内嵌数据里带
+                        # 本次可用的验证方式/端点；不加载页面就盲发码会在状态不符时
+                        # 被 409 invalid_state 打回。若页面直接 3xx，跟随即可。
+                        page_resp = self.session.get(
+                            current_url,
+                            headers=self._navigation_headers(),
+                            timeout=30,
+                            allow_redirects=False,
+                        )
+                        self._trace_http("chain_verify_page", page_resp)
+                        page_loc = page_resp.headers.get("Location", "")
+                        if page_resp.status_code in (301, 302, 303, 307, 308) and page_loc:
+                            if page_loc.startswith("/"):
+                                parsed = urlparse(current_url)
+                                page_loc = f"{parsed.scheme}://{parsed.netloc}{page_loc}"
+                            current_url = page_loc
+                            continue
+
+                        marker = getattr(mail_provider, "mark_all_current_seen", None)
+                        if callable(marker):
+                            marker()
+                        sent_at = time.time()
+                        self.kickoff_otp_delivery("chain_email_verification")
+                        otp_code = mail_provider.wait_for_otp(
+                            email_addr,
+                            timeout=180,
+                            issued_after=sent_at,
+                        )
+                        otp_resp = self.verify_otp(otp_code)
+                        cont = ""
+                        if isinstance(otp_resp, dict):
+                            cont = self._normalize_continue_url(
+                                str(otp_resp.get("continue_url") or "")
+                            )
+                        if cont:
+                            current_url = cont
+                            continue
+                        # 验证已通过、auth.openai 登录态已建立，但 step 响应没给
+                        # continue_url：回读一次当前页面拿 Location 继续追链。
+                        # 这是会话态推进后的正常延续，不是重试兜底。
+                        try:
+                            reloc = self.session.get(
+                                current_url,
+                                headers=self._navigation_headers(),
+                                timeout=30,
+                                allow_redirects=False,
+                            )
+                            self._trace_http("verify_no_continue_reload", reloc)
+                            loc = reloc.headers.get("Location", "")
+                            if (
+                                reloc.status_code in (301, 302, 303, 307, 308)
+                                and loc
+                            ):
+                                if loc.startswith("/"):
+                                    parsed = urlparse(current_url)
+                                    loc = f"{parsed.scheme}://{parsed.netloc}{loc}"
+                                current_url = loc
+                                continue
+                        except Exception as reload_exc:  # noqa: BLE001
+                            logger.warning("验证后回读当前页面失败: %s", reload_exc)
+                        logger.warning("链中邮箱验证通过但无 continue_url")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("链中邮箱验证失败: %s", exc)
+                break
+
+            # 逐跳整页导航，头必须像浏览器：同 auth_oauth_init，旧版只发
+            # Accept/Referer/UA，缺 client hints 和 Sec-Fetch-*（实测那正是
+            # 409 invalid_state 的来源，见 auth_oauth_init docstring）。
+            headers = self._navigation_headers()
+            headers["Referer"] = referer
+            headers.pop("sec-fetch-user", None)   # 302 跟随非用户点击
+            # 跨站跳转（chatgpt.com <-> auth.openai.com）标 cross-site，同站标 same-origin
+            try:
+                headers["sec-fetch-site"] = (
+                    "same-origin"
+                    if urlparse(current_url).netloc == urlparse(referer).netloc
+                    else "cross-site"
+                )
+            except Exception:
+                headers["sec-fetch-site"] = "cross-site"
+            resp = self.session.get(
+                current_url, headers=headers, timeout=30, allow_redirects=False
+            )
+            self._trace_http(f"redirect_hop_{i+1}", resp)
+            referer = current_url
+
+            if "/api/auth/callback/openai" in current_url:
+                callback_url = current_url
+                self._sniff_login_verifier(current_url, f"redirect_hop_{i+1}_callback_url")
+
+            # workspace 页面常见为 200，需要主动调 workspace/select 获取下一跳
+            if "/workspace" in current_url and resp.status_code == 200:
+                workspace_id = self._extract_workspace_id() or self._extract_workspace_id_from_html(resp.text or "")
+                if workspace_id:
+                    logger.info("workspace 页面提取到 workspace_id=%s，尝试继续授权", workspace_id)
+                    next_url = self._workspace_select(workspace_id)
+                    if next_url:
+                        if next_url.startswith("/"):
+                            next_url = urljoin("https://auth.openai.com", next_url)
+                        current_url = next_url
+                        continue
+
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                if not location:
+                    break
+                if location.startswith("/"):
+                    parsed = urlparse(current_url)
+                    location = f"{parsed.scheme}://{parsed.netloc}{location}"
+                # 关键：不要主动 GET callback，避免 code 被服务端回调消费
+                if "/api/auth/callback/openai" in location and "code=" in location:
+                    callback_url = location
+                    current_url = location
+                    self._sniff_login_verifier(location, f"redirect_hop_{i+1}_location_callback")
+                    logger.info("捕获 callback URL（未消费）")
+                    break
+                current_url = location
+                # 打在 INFO：链路失败时（例如最后落在 /auth/error?error=OAuthCallback）
+                # 只有这行能看到每一跳到底去了哪里，DEBUG 级不会写进 run 日志文件。
+                logger.info(
+                    "  重定向 %d/%d: HTTP %s -> %s",
+                    i + 1,
+                    max_hops,
+                    resp.status_code,
+                    current_url[:140],
+                )
+            else:
+                logger.info(
+                    "重定向链在第 %d 跳停止（非 3xx）: %s",
+                    i + 1,
+                    str(current_url)[:160],
+                )
+                break
+
+        # 补一跳首页
+        if (not callback_url) and (not current_url.rstrip("/").endswith("chatgpt.com")):
+            self.session.get(
+                "https://chatgpt.com/",
+                headers={"Referer": current_url},
+                timeout=30,
+            )
+
+        logger.info(f"重定向链完成, callback: {'有' if callback_url else '无'}")
+        return callback_url, current_url
+
+    def _recover_missing_session(
+        self, auth_url: str, mail_provider=None, attempts: int = 2
+    ) -> str:
+        """callback 被 NextAuth 拒绝后，重新 authorize 换新 code 再消费一次。
+
+        触发场景（实测 2026-09-25）：重定向链最后一跳落在
+        ``https://chatgpt.com/auth/error?error=OAuthCallback``，session-token 和
+        access_token 都拿不到。code 是一次性的，同一个已经作废，只能重新
+        authorize 拿新的 code。成功返回新的 callback URL（供后续 Codex 链路使用），
+        失败返回空串，由调用方回落到"密码已落盘、号回 available 走登录续取"。
+        """
+        for attempt in range(1, max(1, attempts) + 1):
+            logger.warning(
+                "callback 未建立 session（session/access 均缺失），第 %d 次重新 authorize",
+                attempt,
+            )
+            try:
+                retry_callback = self._reauthorize_for_session(
+                    auth_url, mail_provider=mail_provider
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("重新 authorize 异常: %s", exc)
+                retry_callback = None
+            if not retry_callback:
+                logger.warning("重新 authorize 未拿到 callback，停止重试")
+                return ""
+            self._consume_callback_for_session(retry_callback)
+            self.get_auth_session()
+            if self.result.session_token or self.result.access_token:
+                logger.info("重新 authorize 后已拿到 session（第 %d 次）", attempt)
+                return retry_callback
+        return ""
+
+    def _reauthorize_for_session(self, original_auth_url: str, mail_provider=None) -> str | None:
+        """已有账号 OTP 验证后，重新发起 authorize 获取 callback URL"""
+        logger.info("[9.5/10] 重新 authorize 获取 session ...")
+        try:
+            # 去掉 prompt=login 参数，利用已有的 auth session cookie
+            from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+            parsed = urlparse(original_auth_url)
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            params.pop("prompt", None)
+            # 重新构建 URL
+            new_query = urlencode({k: v[0] for k, v in params.items()})
+            authorize_url = urlunparse(parsed._replace(query=new_query))
+
+            resp = self.session.get(
+                authorize_url,
+                allow_redirects=False,
+                timeout=15,
+            )
+            self._trace_http("reauthorize_start", resp)
+            logger.info(f"reauthorize status={resp.status_code}")
+
+            # 跟随 redirect chain 找到 callback URL
+            current_url = resp.headers.get("Location", "")
+            logger.info(f"reauthorize Location: {current_url[:150]}")
+            if resp.status_code in (301, 302, 303, 307, 308) and current_url:
+                for hop in range(10):
+                    logger.debug(f"reauthorize redirect hop {hop+1}: {current_url[:100]}")
+                    if "code=" in current_url and "state=" in current_url:
+                        logger.info("reauthorize: 找到 callback URL")
+                        return current_url
+                    # Persona 身份验证页：只有 approved 能由 complete_id_verification
+                    # 推进；其余状态终止，避免在错误步骤上重发 OTP。
+                    if _looks_like_identity_verification_url(current_url):
+                        status = self._get_identity_verification_status()
+                        if (status or "").strip().lower() == "approved":
+                            complete_resp = self._complete_identity_verification()
+                            cont = self._normalize_continue_url(
+                                self._extract_continue_url_from_step(complete_resp)
+                            )
+                            if cont:
+                                current_url = cont
+                                continue
+                        raise IdentityVerificationRequired(status)
+                    # 部分账号的 authorize 会要求再走一次邮箱验证才给 code。
+                    # 此时发码→接码→验证→从 verify 返回的 continue_url 继续追链。
+                    if _looks_like_email_verify_url(current_url) and mail_provider is not None:
+                        email = (self.result.email or "").strip()
+                        if not email:
+                            break
+                        try:
+                            logger.info(
+                                "reauthorize 进入邮箱验证页（%s），自动发码接码",
+                                current_url[:120],
+                            )
+                            marker = getattr(mail_provider, "mark_all_current_seen", None)
+                            if callable(marker):
+                                marker()
+                            sent_at = time.time()
+                            self.kickoff_otp_delivery("existing_reauth")
+                            otp_code = mail_provider.wait_for_otp(
+                                email,
+                                timeout=180,
+                                issued_after=sent_at,
+                            )
+                            otp_resp = self.verify_otp(otp_code)
+                            cont = ""
+                            if isinstance(otp_resp, dict):
+                                cont = self._normalize_continue_url(
+                                    str(otp_resp.get("continue_url") or "")
+                                )
+                            if cont:
+                                current_url = cont
+                                continue
+                            # 验证成功但响应没给 continue_url：邮箱已确认，
+                            # 重新请求 authorize 起点，通常直接进入 OAuth
+                            # consent 拿到 callback。
+                            try:
+                                resp2 = self.session.get(
+                                    authorize_url,
+                                    allow_redirects=False,
+                                    timeout=15,
+                                )
+                                loc2 = resp2.headers.get("Location", "")
+                                if resp2.status_code in (301, 302, 303, 307, 308) and loc2:
+                                    current_url = loc2
+                                    continue
+                            except Exception as exc2:  # noqa: BLE001
+                                logger.warning("reauthorize 验证后重新请求 authorize 失败: %s", exc2)
+                            logger.warning("reauthorize 邮箱验证通过但没有 continue_url")
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("reauthorize email-verification 处理失败: %s", exc)
+                        break
+                    try:
+                        hop_resp = self.session.get(
+                            current_url,
+                            allow_redirects=False,
+                            timeout=15,
+                        )
+                        self._trace_http(f"reauthorize_hop_{hop+1}", hop_resp)
+                        next_loc = hop_resp.headers.get("Location", "")
+                        if hop_resp.status_code not in (301, 302, 303, 307, 308) or not next_loc:
+                            # 检查最终 URL
+                            final_url = str(getattr(hop_resp, 'url', current_url))
+                            if "code=" in final_url:
+                                return final_url
+                            break
+                        current_url = next_loc
+                        if not current_url.startswith("http"):
+                            from urllib.parse import urljoin
+                            current_url = urljoin(authorize_url, current_url)
+                    except Exception:
+                        break
+            logger.warning("reauthorize: 未能获取 callback URL")
+            return None
+        except Exception as e:
+            logger.warning(f"reauthorize 失败: {e}")
+            return None
+
+    # ── Step 11: 获取 session ──
+    def _extract_session_cookie(self) -> str:
+        """多路兜底提取 __Secure-next-auth.session-token cookie。
+
+        curl_cffi 在某些情况下按 domain 隔离 cookie，session.cookies.get(name) 拿不到，
+        所以这里把所有 cookie 都遍历一遍，按名字精确匹配。
+        """
+        target = "__Secure-next-auth.session-token"
+        # 路径1：直接 get
+        try:
+            v = self.session.cookies.get(target, "")
+            if v:
+                return v
+        except Exception:
+            pass
+        # 路径2：遍历 jar
+        try:
+            for c in self.session.cookies:
+                name = getattr(c, "name", "") if hasattr(c, "name") else str(c)
+                if name == target:
+                    val = getattr(c, "value", "") or ""
+                    if val:
+                        return val
+        except Exception:
+            pass
+        # 路径3：用 _get_cookie_value_by_name（不挑 domain）
+        try:
+            return self._get_cookie_value_by_name(target)
+        except Exception:
+            return ""
+
+    def get_auth_session(self) -> tuple[str, str]:
+        """获取 session_token 和 access_token。
+
+        session_token 三路兜底（按优先级）：
+          1. cookie `__Secure-next-auth.session-token`（NextAuth 数据库 session 策略）
+          2. JSON 响应里的 `sessionToken` 字段（NextAuth JWT session 策略，某些路径）
+          3. 兼容大小写 / 下划线变体
+        access_token 取 JSON 响应里的 `accessToken`。
+        """
+        first_call = not getattr(self, "_auth_session_fetched", False)
+        self._auth_session_fetched = True
+        if first_call:
+            logger.info("[10/10] 获取认证 Session...")
+        headers = self._common_headers("https://chatgpt.com/")
+        resp = self.session.get(
+            "https://chatgpt.com/api/auth/session",
+            headers=headers,
+            timeout=30,
+        )
+        self._trace_http("chatgpt_auth_session", resp)
+        resp.raise_for_status()
+
+        try:
+            sess_json = resp.json() if resp is not None else {}
+        except Exception:
+            sess_json = {}
+        if not isinstance(sess_json, dict):
+            sess_json = {}
+
+        cookie_st = self._extract_session_cookie()
+        json_st = (
+            sess_json.get("sessionToken", "")
+            or sess_json.get("session_token", "")
+            or ""
+        )
+        session_token = cookie_st or json_st
+        access_token = sess_json.get("accessToken", "") or sess_json.get("access_token", "") or ""
+
+        if session_token:
+            self.result.session_token = session_token
+        if access_token:
+            self.result.access_token = access_token
+        self.result.cookie_header = self._build_chatgpt_cookie_header()
+
+        _log = logger.info if first_call else logger.debug
+        _log(f"session: st={'有' if session_token else '无'} at={'有' if access_token else '无'}")
+        return session_token, access_token
+
+    def _consume_callback_for_session(self, callback_url: str) -> bool:
+        """主动 GET callback URL 让 chatgpt.com NextAuth 设 session cookie。
+
+        协议层 follow_redirect_chain 故意不消费 callback（为后续 OAuth token exchange 留 code），
+        但这导致 NextAuth 永远不会写 __Secure-next-auth.session-token cookie。
+        在拿不到 session_token 时主动消费一次 callback：跟随到 chatgpt.com 主页，
+        服务器会 Set-Cookie session-token。
+        """
+        if not callback_url or "code=" not in callback_url:
+            return False
+        try:
+            current = callback_url
+            for hop in range(8):
+                resp = self.session.get(
+                    current,
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Referer": "https://auth.openai.com/",
+                        "User-Agent": self._ua,
+                    },
+                    timeout=30,
+                    allow_redirects=False,
+                )
+                self._trace_http(f"consume_callback_hop_{hop+1}", resp)
+                if resp.status_code not in (301, 302, 303, 307, 308):
+                    break
+                loc = (resp.headers.get("Location", "") or "").strip()
+                if not loc:
+                    break
+                if loc.startswith("/"):
+                    loc = urljoin(current, loc)
+                current = loc
+                # 已到 chatgpt.com 主页就够
+                parsed = urlparse(current)
+                if "chatgpt.com" in (parsed.netloc or "") and "/api/auth/callback" not in current:
+                    # 再 GET 一下主页，让 cookie 全部落地
+                    try:
+                        self.session.get(current, timeout=20, allow_redirects=True)
+                    except Exception:
+                        pass
+                    break
+            return bool(self.session.cookies.get("__Secure-next-auth.session-token", ""))
+        except Exception as e:
+            logger.warning(f"消费 callback 失败: {e}")
+            return False
+
+    # ── 可选: OAuth Token 交换 ──
+    def oauth_token_exchange(self, callback_url: str, continue_url: str) -> bool:
+        """
+        交换 OAuth token（尽力模式）：
+        1) 尝试多来源 code_verifier（query/cookie/dump/hydra）
+        2) 回退无 verifier
+        """
+        self._oauth_failure_reason = ""
+        self._oauth_failure_details = {}
+        auth_code = self._extract_query_first(callback_url, ["code"]) or self._extract_query_first(continue_url, ["code"])
+
+        if not auth_code:
+            self._set_oauth_failure("callback_missing_code")
+            logger.info("缺少 auth_code，跳过 token 交换")
+            return False
+
+        verifier_candidates = self._collect_code_verifier_candidates(callback_url, continue_url)
+        if not verifier_candidates:
+            logger.info("当前未获取到可用 code_verifier，将先尝试无 verifier 交换")
+        else:
+            show = ", ".join([f"{src}:{len(v)}" for src, v in verifier_candidates[:8]])
+            logger.info("code_verifier 候选数=%s 示例=%s", len(verifier_candidates), show)
+
+        logger.info("执行 OAuth Token 交换...")
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "Origin": "https://auth.openai.com",
+            "Referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        }
+        base_form = {
+            "grant_type": "authorization_code",
+            "client_id": self._oauth_client_id or "YOUR_OPENAI_WEB_CLIENT_ID",
+            "code": auth_code,
+            "redirect_uri": self._oauth_redirect_uri or "https://chatgpt.com/api/auth/callback/openai",
+        }
+        logger.info(
+            "Token 交换参数: client_id=%s redirect_uri=%s",
+            base_form["client_id"],
+            base_form["redirect_uri"],
+        )
+
+        candidates: list[tuple[str, dict]] = []
+        if self._oauth_client_secret:
+            d = dict(base_form)
+            d["client_secret"] = self._oauth_client_secret
+            candidates.append(("with_client_secret", d))
+
+        try:
+            max_verifier_try = max(1, int(os.getenv("OAUTH_MAX_VERIFIER_TRY", "18")))
+        except Exception:
+            max_verifier_try = 18
+
+        for src, verifier in verifier_candidates[:max_verifier_try]:
+            d = dict(base_form)
+            d["code_verifier"] = verifier
+            candidates.append((f"with_verifier_{src}", d))
+            if self._oauth_client_secret:
+                d2 = dict(d)
+                d2["client_secret"] = self._oauth_client_secret
+                candidates.append((f"with_verifier_{src}_and_client_secret", d2))
+
+        # 一些服务端可能要求额外参数（实验候选）
+        audience = self._extract_query_first(self._oauth_auth_url, ["audience"])
+        if audience:
+            d = dict(base_form)
+            d["audience"] = audience
+            candidates.append(("without_verifier_with_audience", d))
+        if self._oauth_scope:
+            d = dict(base_form)
+            d["scope"] = self._oauth_scope
+            candidates.append(("without_verifier_with_scope", d))
+
+        candidates.append(("without_verifier", dict(base_form)))
+
+        seen_fingerprints: set[str] = set()
+        for mode, form in candidates:
+            fp = json.dumps(form, sort_keys=True, ensure_ascii=False)
+            if fp in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fp)
+            try:
+                self._sniff_login_verifier(urlencode(form), f"oauth_token_exchange_{mode}:form")
+            except Exception:
+                pass
+            encoded_form = urlencode(form)
+            extra_request = {
+                "method": "POST",
+                "url": "https://auth.openai.com/oauth/token",
+                "body": encoded_form,
+                "headers": headers,
+            }
+
+            resp = self.session.post(
+                "https://auth.openai.com/oauth/token",
+                headers=headers,
+                data=encoded_form,
+                timeout=30,
+            )
+            self._trace_http(f"oauth_token_exchange_{mode}", resp, extra_request=extra_request)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception as exc:
+                    self._set_oauth_failure("token_invalid_json")
+                    logger.warning(
+                        "Token 交换响应 JSON 解析失败(mode=%s): %s",
+                        mode,
+                        type(exc).__name__,
+                    )
+                    return False
+                if not isinstance(data, dict):
+                    self._set_oauth_failure("token_invalid_payload")
+                    logger.warning(
+                        "Token 交换响应不是对象(mode=%s): type=%s",
+                        mode,
+                        type(data).__name__,
+                    )
+                    return False
+
+                raw_refresh_token = data.get("refresh_token")
+                response_keys, error_code = self._oauth_response_metadata(data)
+                if raw_refresh_token is not None and not isinstance(raw_refresh_token, str):
+                    self._set_oauth_failure(
+                        "token_invalid_payload", status_code=resp.status_code, response_keys=response_keys,
+                    )
+                    return False
+                refresh_token = raw_refresh_token.strip() if isinstance(raw_refresh_token, str) else ""
+                # A 200 response can still be an incomplete token response.
+                # Do not turn that into an OAuth success or erase a token from
+                # an earlier valid exchange.
+                if not refresh_token:
+                    self._set_oauth_failure(
+                        "token_missing_refresh_token",
+                        status_code=resp.status_code,
+                        response_keys=response_keys,
+                        error_code=error_code,
+                    )
+                    logger.warning(
+                        "Token 交换响应缺少 refresh_token(mode=%s): status=%s keys=%s error=%s",
+                        mode,
+                        resp.status_code,
+                        response_keys,
+                        error_code,
+                    )
+                    return False
+
+                self.result.id_token = data.get("id_token", self.result.id_token) or self.result.id_token
+                self.result.access_token = data.get("access_token", self.result.access_token) or self.result.access_token
+                self.result.refresh_token = refresh_token
+                self._oauth_failure_reason = ""
+                self._oauth_failure_details = {}
+                logger.info(
+                    "Token 交换成功(mode=%s): refresh_token=%s",
+                    mode,
+                    "有",
+                )
+                return True
+
+            try:
+                error_payload = resp.json()
+            except Exception:
+                error_payload = {}
+            error_keys, error_code = self._oauth_response_metadata(error_payload)
+            logger.warning(
+                "Token 交换失败(mode=%s): status=%s keys=%s error=%s",
+                mode,
+                resp.status_code,
+                error_keys,
+                error_code,
+            )
+            self._set_oauth_failure(
+                "token_http_error",
+                status_code=resp.status_code,
+                response_keys=error_keys,
+                error_code=error_code,
+            )
+
+        return False
+
+    def oauth_secondary_authorize_exchange(self) -> bool:
+        """
+        二次授权实验：
+        - 在当前已登录会话上，重新发起一条带 PKCE 的 authorize
+        - 仅提取 callback code，不消费 callback
+        - 再走 oauth/token 交换
+        """
+        self._oauth_failure_reason = ""
+        self._oauth_failure_details = {}
+        logger.info("尝试二次 authorize + PKCE 换 refresh_token ...")
+        try:
+            csrf = self.get_csrf_token()
+            auth_url = self.get_auth_url(csrf)
+        except Exception as e:
+            self._set_oauth_failure("authorize_init_failed", exception_type=type(e).__name__)
+            return False
+
+        try:
+            verifier, challenge = self._build_pkce_pair()
+            parsed = urlparse(auth_url)
+            params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            params["code_challenge"] = challenge
+            params["code_challenge_method"] = "S256"
+            if not params.get("state"):
+                params["state"] = self._b64url_no_pad(os.urandom(16))
+            sec_url = urlunparse(parsed._replace(query=urlencode(params)))
+
+            self._manual_login_verifier = verifier
+            self._captured_login_verifier = verifier
+            self._remember_oauth_params(sec_url)
+
+            current = sec_url
+            callback_url = ""
+            max_hops = 10
+            for i in range(max_hops):
+                resp = self.session.get(
+                    current,
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Referer": "https://chatgpt.com/",
+                        "User-Agent": self._ua,
+                    },
+                    timeout=30,
+                    allow_redirects=False,
+                )
+                self._trace_http(f"secondary_authorize_hop_{i+1}", resp)
+
+                loc = (resp.headers.get("Location", "") or "").strip()
+                if loc and loc.startswith("/"):
+                    loc = urljoin(current, loc)
+
+                if loc and "/api/auth/callback/openai" in loc and "code=" in loc:
+                    callback_url = loc
+                    break
+                if resp.status_code not in (301, 302, 303, 307, 308) or not loc:
+                    break
+                current = loc
+
+            if not callback_url:
+                self._set_oauth_failure(
+                    "callback_not_returned",
+                    final_path=self._oauth_url_path(current),
+                    status_code=resp.status_code,
+                )
+                logger.warning("二次 authorize 未捕获 callback code")
+                return False
+
+            ok = self.oauth_token_exchange(callback_url, callback_url)
+            logger.info("二次 authorize 交换结果: %s", "成功" if ok else "失败")
+            return ok
+        except Exception as e:
+            self._set_oauth_failure("oauth_exception", exception_type=type(e).__name__)
+            return False
+
+    # ── 完整注册流程 ──
+    def run_register(self, mail_provider: MailProvider) -> AuthResult:
+        """执行完整注册流程"""
+        # 检查网络
+        if not self.check_proxy():
+            raise NetworkPreflightError(
+                getattr(self, "_network_preflight_error", "") or "网络预检查未通过"
+            )
+        # warmup 失败 = 没拿到 oai-did = 后面 authorize/continue 必 409（实测 5/5）。
+        # 必须在 create_mailbox 之前拦掉：邮箱是花钱的，不能为一个注定 409 的轮次浪费。
+        if not self.warmup():
+            raise RuntimeError(
+                "warmup 失败：6 次重试均未拿到 chatgpt.com 的 oai-did cookie，"
+                "继续注册必然 409 invalid_state（多为代理出口 IP 不通或被 CF 拦），"
+                "请检查代理后重试"
+            )
+
+        # 创建邮箱
+        email = mail_provider.create_mailbox()
+        self.result.email = email
+
+        # 登录/注册链路
+        csrf_token = self.get_csrf_token()
+        auth_url = self.get_auth_url(csrf_token, email=email)
+        device_id = self.auth_oauth_init(auth_url)
+        sentinel = self.get_sentinel_token(device_id)
+        is_new = self.signup(email, sentinel)
+
+        # 号池邮箱被 OpenAI 标"已有账号" 处理策略:
+        #   WEBUI_ALLOW_LOGIN=1 (promo-link 等需要拿 access_token 的模式) → 走 OTP login 拿凭证
+        #   WEBUI_ALLOW_LOGIN 未设 (register-only 模式) → fast-fail mark dead 换下一个号
+        # 这样 register-only 不被 honeypot 拖死, promo-link 又能复用已存在账号.
+        #
+        # ⚠️ 这个分支对**所有号池型 provider** 生效（outlook / icloud_relay / 以后新增的），
+        #    不是 outlook 专属 —— 日志前缀用 provider 自己的 kind，别写死。
+        pool_tag = getattr(mail_provider, "kind", "pool")
+        is_pooled_existing = (
+            not is_new
+            and self._existing_email_verification_mode != "passwordless_signup"
+            and getattr(mail_provider, "pooled", False)
+        )
+        if is_pooled_existing:
+            _allow_login = self._get_env("WEBUI_ALLOW_LOGIN", "").strip() in (
+                "1", "true", "yes",
+            )
+            if _allow_login:
+                logger.info(
+                    f"[{pool_tag}] '已有账号' 分支但 WEBUI_ALLOW_LOGIN=1 → 走 OTP login 拿凭证 ({email})"
+                )
+            else:
+                logger.warning(
+                    f"[{pool_tag}] '已有账号' 分支检测到号池邮箱 ({email}) → fast-fail mark dead, "
+                    f"让外层 register() 自动 claim 下一个号 (设 WEBUI_ALLOW_LOGIN=1 改走 OTP login)"
+                )
+                try:
+                    mail_provider.mark_dead(
+                        "OpenAI 识别为已有账号 (接码池二手 / honeypot, 协议层 fast-fail)"
+                    )
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"OpenAI 静默拒绝发 OTP (识别 {email} 为已有账号, {pool_tag} 池 fast-fail)"
+                )
+
+        # ⚠️ passwordless_signup **也是新账号**，只是服务端选择了"不设密码直接发码"的注册流程。
+        #    signup() 用一个 bool 表达三种服务端状态，把它和"已有账号"压成了同一个 False，
+        #    结果新号全部走进下面的 else 分支 —— register_password 从没被调用过，
+        #    注册出来的号全是无密码号（只能靠临时邮箱收码登录，域名一失效就永久丢失）。
+        #    实测 2026-08-06: 这类号照样能走 POST user/register 设密码并成功。
+        if is_new or self._existing_email_verification_mode == "passwordless_signup":
+            # 新账号：注册密码 → 主动重新发码 → 验证 OTP → 创建账户
+            password_registered = self.register_password(email)
+            if password_registered:
+                # ⚠️ POST user/register 成功后服务端**切换流程**到 email_otp_send 页
+                #    （实测响应 continue_url=/api/accounts/email-otp/send, page.type=email_otp_send），
+                #    signup 阶段自动发的那封 OTP 立即失效，拿它 verify 会 409 invalid_state。
+                #    所以必须主动重新发码，且以本次发码时间为准，不能再用 -8 偏移。
+                #    时间戳在发码**之前**取：邮件是服务端在这次请求里发出的，
+                #    先发再取时间会让 otp_sent_at 晚于邮件时间戳，被 issued_after 过滤掉。
+                otp_sent_at = time.time()
+                try:
+                    self.send_otp()
+                except Exception as e:
+                    logger.warning(f"密码注册后主动发码失败: {e}")
+                    if not self._kickoff_new_registration_otp():
+                        raise
+            else:
+                raise PasswordRequiredError("密码设置未获服务端确认，本次注册已停止")
+
+            try:
+                otp_timeout = max(180, int(self._get_env("OTP_TIMEOUT", "180")))
+            except Exception:
+                otp_timeout = 180
+            try:
+                otp_code = mail_provider.wait_for_otp(
+                    email,
+                    timeout=otp_timeout,
+                    issued_after=otp_sent_at,
+                )
+            except TimeoutError:
+                # Relay delivery can lag behind the auth request. Re-send once
+                # before failing, matching the existing-account login path.
+                logger.warning("新注册 OTP 首次等待超时，重发后再等待")
+                otp_sent_at = time.time()
+                if not self._kickoff_new_registration_otp():
+                    raise
+                otp_code = mail_provider.wait_for_otp(
+                    email,
+                    timeout=otp_timeout,
+                    issued_after=otp_sent_at,
+                )
+            try:
+                self.verify_otp(otp_code)
+                self.fetch_client_auth_session_dump("post_verify_otp_new")
+            except RuntimeError as e:
+                # 偶发 401 错码，补发一次 OTP 并重试
+                if "401" in str(e):
+                    logger.warning(f"OTP 首次验证失败，补发重试: {e}")
+                    otp_sent_at = time.time()
+                    if not self._kickoff_new_registration_otp():
+                        raise
+                    otp_code = mail_provider.wait_for_otp(
+                        email,
+                        timeout=otp_timeout,
+                        issued_after=otp_sent_at,
+                    )
+                    self.verify_otp(otp_code)
+                    self.fetch_client_auth_session_dump("post_verify_otp_retry_new")
+                else:
+                    raise
+
+            try:
+                continue_url = self.create_account()
+            except Exception as e:
+                # registration_disallowed 时尝试 reauthorize 兜底，若仍不可用再抛出
+                if self._is_registration_disallowed_error(e):
+                    logger.warning("create_account 被拒绝，尝试 reauthorize 兜底获取 session ...")
+                    continue_url = self._reauthorize_for_session(auth_url, mail_provider=mail_provider) or ""
+                    if not continue_url:
+                        raise
+                else:
+                    raise
+        else:
+            # 已有账号：直接发 OTP → 验证 → 获取 session
+            login_password, pw_is_real = self._resolve_login_password(email)
+            if not pw_is_real:
+                raise PasswordRequiredError(
+                    "已有账号缺少已保存密码；请先在官网设置或重置密码，"
+                    "再更新本地凭证后重试"
+                )
+            self.result.password = login_password
+            mode = (self._existing_email_verification_mode or "").lower()
+            page_type = (self._existing_page_type or "").lower()
+            continue_url = ""
+
+            try:
+                otp_timeout = max(180, int(self._get_env("OTP_TIMEOUT", "180")))
+            except Exception:
+                otp_timeout = 180
+
+            if page_type == "login_password":
+                logger.info("已有账号进入 login_password 分支，先走密码校验再 OTP")
+                login_password, pw_is_real = self._resolve_login_password(email)
+                if pw_is_real:
+                    self.result.password = login_password
+                else:
+                    logger.info("该号无已知密码，用默认规则猜一个试试（多半 401）")
+                login_resp = self.login_password_verify(login_password)
+                login_page_type = self._extract_page_type(login_resp)
+                continue_url = self._normalize_continue_url(
+                    (login_resp or {}).get("continue_url", "") if isinstance(login_resp, dict) else ""
+                )
+
+                # mfa-challenge 分支（密码验证后需要 TOTP 2FA）
+                if self._is_mfa_challenge_state(login_page_type, continue_url):
+                    totp_secret = (self.result.totp_secret or "").strip()
+                    if not totp_secret and self._account_callback:
+                        # 从数据库加载凭证
+                        try:
+                            cred = self._account_callback(email)
+                            if cred and cred.get("totp_secret"):
+                                totp_secret = cred["totp_secret"]
+                                self.result.totp_secret = totp_secret
+                                logger.info("已从数据库加载 totp_secret")
+                        except Exception as e:
+                            logger.warning(f"account_callback 异常: {e}")
+                    if not totp_secret:
+                        raise RuntimeError("MFA 验证失败：进入 mfa-challenge 但本地没有 totp_secret")
+                    else:
+                        challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
+                        if challenge_id:
+                            totp_code = _totp_now(totp_secret)
+                            logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
+                            mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
+                            continue_url = self._normalize_continue_url(
+                                (mfa_resp or {}).get("continue_url", "") if isinstance(mfa_resp, dict) else ""
+                            )
+                        else:
+                            raise RuntimeError("MFA 验证失败：continue_url 缺少 challenge_id")
+
+                # 部分账号密码校验后仍需 email otp（二次校验）
+                elif not continue_url or _looks_like_email_verify_url(continue_url):
+                    # password/verify 后推荐使用 resend，而不是 /email-otp/send
+                    otp_sent_at = time.time()
+                    self.kickoff_otp_delivery("existing_login_password")
+                    otp_code = mail_provider.wait_for_otp(
+                        email,
+                        timeout=otp_timeout,
+                        issued_after=otp_sent_at,
+                    )
+                    otp_resp = self.verify_otp(otp_code)
+                    continue_url = self._normalize_continue_url(
+                        (otp_resp or {}).get("continue_url", "") if isinstance(otp_resp, dict) else ""
+                    )
+            else:
+                need_send_otp = mode not in ("passwordless_signup", "passwordless_login")
+                if need_send_otp:
+                    otp_sent_at = time.time()
+                    self.send_otp()
+                else:
+                    # 某些模式在 /authorize/continue 已触发发码，不要重复 /email-otp/send 以免破坏 state
+                    # 默认先尝试 /email-otp/resend 获取新码，失败再回看短窗口
+                    # An authorize/continue response may report the OTP state as
+                    # ready before the relay has actually exposed the message.
+                    # Waiting the full timeout before asking for a fresh delivery
+                    # made every transient relay delay cost two long polls.  A
+                    # resend keeps the existing challenge state and is the
+                    # reliable default for pooled mailboxes; callers can still
+                    # disable it explicitly with OTP_FORCE_RESEND=0.
+                    default_force_resend = "1" if getattr(mail_provider, "pooled", False) else "0"
+                    forced_resend = self._env_flag("OTP_FORCE_RESEND", default_force_resend)
+                    resend_ok = False
+                    if forced_resend:
+                        otp_sent_at = time.time()
+                        try:
+                            resend_ok = self.kickoff_otp_delivery("existing_forced_resend")
+                        except Exception as resend_error:
+                            # A failed resend must not hide the original
+                            # challenge. Fall back to the short look-back
+                            # window and let the normal OTP poll decide.
+                            logger.warning("已有账号主动 resend 异常，回看原验证码: %s", resend_error)
+                        if resend_ok:
+                            logger.debug(f"已有账号验证码模式={mode}，已主动 resend OTP")
+                    if not resend_ok:
+                        # 回看短窗口，避免误读上一轮旧验证码；这也 keeps
+                        # test doubles and providers without a resend endpoint
+                        # on the original challenge path.
+                        otp_sent_at = time.time() - 8
+                        logger.info(f"已有账号验证码模式={mode}，跳过额外 send_otp，直接等邮件")
+
+                try:
+                    otp_code = mail_provider.wait_for_otp(
+                        email,
+                        timeout=otp_timeout,
+                        issued_after=otp_sent_at,
+                    )
+                except TimeoutError:
+                    # provider 判定自己已无可用收件链路时会设 exhausted=True 并 mark_dead，
+                    # 不 retry 直接 raise，避免再次等待无效收件链路。
+                    # （outlook 是 IMAP-only 纯协议失败；别的 provider 有自己的判据。）
+                    if getattr(mail_provider, "exhausted", False):
+                        logger.warning(
+                            f"[{getattr(mail_provider, 'kind', 'mail')}] "
+                            f"收码链路已失效并 mark dead, 跳过 retry resend"
+                        )
+                        raise
+                    # 否则 (非号池场景, 如 catch_all CF KV) 给一次 resend retry
+                    logger.warning("未等到已有账号 OTP，先重发后重试等待")
+                    otp_sent_at = time.time()
+                    if not self.kickoff_otp_delivery("existing_timeout_retry"):
+                        self.send_otp()
+                    try:
+                        otp_code = mail_provider.wait_for_otp(
+                            email,
+                            timeout=otp_timeout,
+                            issued_after=otp_sent_at,
+                        )
+                    except TimeoutError:
+                        # 两次 timeout 只能证明本流程没有取得新验证码，不能证明服务端拒发。
+                        # 号池在耗尽重试后隔离，避免自动循环领取同一邮箱。
+                        # 让池下次跳过，user 重新点 ▶ 自动 claim 下一个 available。
+                        # （非号池 provider 如 CF 临时邮箱 mark_dead 是空操作，不用额外判断。）
+                        if getattr(mail_provider, "pooled", False):
+                            try:
+                                mail_provider.mark_dead(
+                                    "OTP 重发后仍超时，收件链路未确认收到新邮件"
+                                )
+                            except Exception:
+                                pass
+                        raise
+                try:
+                    otp_resp = self.verify_otp(otp_code)
+                    self.fetch_client_auth_session_dump("post_verify_otp_existing")
+                except RuntimeError as e:
+                    if any(code in str(e) for code in ("401", "409")):
+                        logger.warning(f"OTP 首次验证失败，重发重试: {e}")
+                        otp_sent_at = time.time()
+                        if not self.kickoff_otp_delivery("existing_verify_retry"):
+                            self.send_otp()
+                        otp_code = mail_provider.wait_for_otp(
+                            email,
+                            timeout=otp_timeout,
+                            issued_after=otp_sent_at,
+                        )
+                        otp_resp = self.verify_otp(otp_code)
+                        self.fetch_client_auth_session_dump("post_verify_otp_retry_existing")
+                    else:
+                        raise
+                continue_url = (otp_resp or {}).get("continue_url", "") if isinstance(otp_resp, dict) else ""
+                continue_url = self._normalize_continue_url(continue_url)
+                if self._is_add_phone_state(page_type=self._extract_page_type(otp_resp), continue_url=continue_url):
+                    continue_url = self._normalize_continue_url(
+                        self._handle_add_phone_verification(continue_url=continue_url)
+                    )
+
+            # 某些已有账号在 OTP 后会进入 about-you，需要补一次 create_account
+            if continue_url and "/about-you" in continue_url:
+                try:
+                    continue_url = self.create_account()
+                except IdentityVerificationRequired:
+                    # Persona 证件验证是风控终态，不能吞掉后走 reauthorize
+                    # 兜底——那样会再发一轮 OTP 把风险分刷高。
+                    raise
+                except Exception as e:
+                    if self._is_registration_disallowed_error(e):
+                        logger.warning("about-you create_account 被拒绝，尝试 reauthorize 兜底获取 session ...")
+                        continue_url = self._reauthorize_for_session(auth_url, mail_provider=mail_provider) or ""
+                        if continue_url:
+                            logger.info("reauthorize 兜底成功，继续后续 session 获取")
+                            # 下游会走 follow_redirect_chain + get_auth_session
+                            pass
+                        else:
+                            raise
+                    else:
+                        logger.warning(f"已有账号 about-you 创建信息失败，回退 reauthorize: {e}")
+                        continue_url = ""
+
+            # 若 otp 响应未给可用 continue_url，则回退到 reauthorize
+            if not continue_url:
+                # auth.openai.com 的 session cookie 已设置，直接拿 code
+                continue_url = self._reauthorize_for_session(auth_url, mail_provider=mail_provider)
+
+        if continue_url:
+            continue_url = self._normalize_continue_url(continue_url)
+            # 关键尝试：在 chatgpt callback 被消费前，先走一次 Codex OAuth（有助于保留 auth.openai 登录态）
+            # ⚠️ 挂了 on_session_ready 钩子时**跳过这次抢跑**：钩子（绑 2FA）要等
+            #    get_auth_session 拿到 access_token 才能跑，而那步在下面 :callback 之后；
+            #    这次抢跑成功的话 Codex 就跑到钩子前面去了，指定的顺序等于没改。
+            #    跳过后 Codex 落到后面那个调用点（get_auth_session 之后），顺序才是
+            #    创建账户 → 重定向链 → 拿 session → 绑 2FA → Codex 授权 → 接码。
+            if (
+                (not self.result.refresh_token)
+                and self._on_session_ready is None
+                and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1")
+            ):
+                self.oauth_codex_rt_exchange(mail_provider=mail_provider)
+            # 可选：在 callback 被消费前尝试 token 交换（可能影响后续 callback，默认关闭）
+            refresh_only_mode = self._env_flag("OAUTH_REFRESH_ONLY", "0")
+            pre_exchange_default = "1" if refresh_only_mode else "0"
+            pre_exchange = self._env_flag("OAUTH_EXCHANGE_BEFORE_CALLBACK", pre_exchange_default)
+            if pre_exchange and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
+                self.oauth_token_exchange(continue_url, continue_url)
+            callback_url, final_url = self.follow_redirect_chain(
+                continue_url,
+                mail_provider=mail_provider,
+                email=self.result.email or "",
+            )
+            if (not callback_url) and final_url and ("/workspace" in final_url):
+                normalized = self._normalize_continue_url(final_url)
+                if normalized and normalized != final_url:
+                    callback_url, final_url = self.follow_redirect_chain(
+                        normalized,
+                        mail_provider=mail_provider,
+                        email=self.result.email or "",
+                    )
+            # 已有账号 OTP 登录的重定向链偶尔走不到 callback（实测约 0.7%），
+            # 表现为「callback: 无 → session st/at 全空 → 凭证缺失」。此时
+            # auth.openai 的登录态 cookie 已经建立，重新 authorize 一次即可
+            # 拿到新的 callback code，无需把号判死。
+            if (not callback_url) and self._is_existing_account:
+                logger.warning("重定向链未捕获 callback，尝试 reauthorize 兜底")
+                try:
+                    reauth_url = self._reauthorize_for_session(auth_url, mail_provider=mail_provider)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("reauthorize 兜底异常: %s", exc)
+                    reauth_url = None
+                if reauth_url:
+                    logger.info("reauthorize 兜底拿到新的 authorize URL，重新跟踪重定向链")
+                    callback_url, final_url = self.follow_redirect_chain(
+                        reauth_url,
+                        mail_provider=mail_provider,
+                        email=self.result.email or "",
+                    )
+        else:
+            callback_url, final_url = None, None
+
+        refresh_only_mode = self._env_flag("OAUTH_REFRESH_ONLY", "0")
+
+        # ─ 关键顺序修复 ─
+        # 旧版顺序：get_auth_session → oauth_token_exchange → _consume_callback (兜底)
+        # 问题：oauth_token_exchange 直接 POST /oauth/token 用掉了 callback 的 code，
+        #       后面 _consume_callback 再 GET callback URL 时 code 已失效 →
+        #       NextAuth 拒绝 set __Secure-next-auth.session-token cookie。
+        # 新版：先 _consume_callback 让 chatgpt.com NextAuth 自己消费 code 并 set 全套
+        #       cookie（含 session-token），然后再 get_auth_session 拿 access_token；
+        #       Codex RT exchange 用独立 authorize 链路，跟 chatgpt callback 不冲突。
+        if (not refresh_only_mode) and callback_url:
+            logger.debug("消费 callback 触发 NextAuth Set-Cookie (session-token)")
+            self._consume_callback_for_session(callback_url)
+
+        if not refresh_only_mode:
+            self.get_auth_session()
+            # callback 被 NextAuth 拒绝时（日志里表现为重定向链最后落在
+            # https://chatgpt.com/auth/error?error=OAuthCallback），session-token
+            # 和 access_token 一个都拿不到。原因通常是 code 已被消费 / state 校验
+            # 失败，同一个 code 不可复用 —— 在链路内重新 authorize 换一个新 code
+            # 再消费一次即可，最多重试 2 轮；仍失败才回落到"密码已落盘、号回
+            # available 走登录续取"的既有路径。
+            if not self.result.session_token and not self.result.access_token:
+                recovered_callback = self._recover_missing_session(
+                    auth_url, mail_provider=mail_provider
+                )
+                if recovered_callback:
+                    callback_url = recovered_callback
+
+        # ── 钩子：session 到手、Codex 授权之前 ──
+        # 主人指定的顺序是「注册完 → 绑 2FA → Codex 授权 → 接码」。这里是唯一同时满足
+        # 「已经有 access_token」和「Codex 还没跑」的位置，所以插在这。
+        # 失败绝不能拖垮已注册成功的号 —— 异常吞掉，继续往下走 Codex。
+        if self._on_session_ready is not None and self.result.access_token:
+            try:
+                self._on_session_ready(self, self.result.access_token)
+            except Exception as e:
+                raise RuntimeError(f"session_ready 回调失败: {e}") from e
+
+        # Codex OAuth refresh_token 交换（独立 authorize 链路，不依赖上面 callback 的 code）
+        if callback_url or continue_url:
+            self.fetch_client_auth_session_dump("pre_oauth_exchange_register")
+            # 注意：oauth_token_exchange(callback_url) 会和 NextAuth 抢同一个 code，
+            # 默认禁用避免冲突；只有用户显式 SET OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK=1
+            # 才尝试（极少需要，access_token 已通过 NextAuth callback 拿到）。
+            if self._env_flag("OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK", "0") \
+                    and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
+                self.oauth_token_exchange(callback_url or "", continue_url or "")
+            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
+                self.oauth_codex_rt_exchange(mail_provider=mail_provider)
+            if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
+                self.oauth_secondary_authorize_exchange()
+            # 最终再拉一次 session（Codex 流程可能更新 cookie/access_token）
+            if not refresh_only_mode:
+                self.get_auth_session()
+
+        if refresh_only_mode:
+            if not (self.result.refresh_token or self.result.access_token):
+                raise RuntimeError("流程完成但未获取 refresh_token/access_token")
+        elif not self.result.is_valid():
+            raise RuntimeError("注册完成但未获取有效凭证")
+
+        logger.info(
+            "认证步骤结束: access_token_present=%s session_token_present=%s refresh_token_present=%s",
+            bool(self.result.access_token), bool(self.result.session_token), bool(self.result.refresh_token),
+        )
+        return self.result
+
+    # ── 纯协议已有账号登录流程（目标：拿 callback/session/refresh） ──
+    def run_protocol_login(self, mail_provider: MailProvider, email: str, password: str = "") -> AuthResult:
+        """
+        纯协议登录（不创建随机邮箱）：
+        - 适配 passwordless / login_password 两类已有账号入口
+        - 可配合 OAUTH_EXCHANGE_BEFORE_CALLBACK / OAUTH_REFRESH_ONLY 尝试优先拿 refresh_token
+        """
+        if not (email or "").strip():
+            raise RuntimeError("run_protocol_login 缺少邮箱")
+
+        if not self.check_proxy():
+            raise NetworkPreflightError(
+                getattr(self, "_network_preflight_error", "") or "网络预检查未通过"
+            )
+        # 同 run_register：没 oai-did 就走不通 authorize 链，早失败早换 IP。
+        # 这里不花钱建邮箱，但报错说清原因，省得当成"密码错"排查。
+        if not self.warmup():
+            raise RuntimeError(
+                "warmup 失败：6 次重试均未拿到 chatgpt.com 的 oai-did cookie，"
+                "继续登录必然 409 invalid_state（多为代理出口 IP 不通或被 CF 拦），"
+                "请检查代理后重试"
+            )
+
+        # run_protocol_login 的语义即"登录已有账号"（docstring 明写）。kickoff_otp_delivery
+        # 依据 _is_existing_account 选 resend vs send_passwordless_otp 分支；落到 send
+        # 分支会把 server-side state 弄坏 → 之后 IMAP 抓到的 OTP X 已失效 → verify 401
+        # wrong_email_otp_code。这里入口统一 set True，覆盖 passwordless 这类 page_type
+        # 不在 ("login_password","email_otp_verification") 集合的情况；signup() 回退
+        # 路径会基于 OpenAI 真实响应再次覆盖（True/False），无副作用。
+        self._is_existing_account = True
+
+        email = email.strip()
+        self.result.email = email
+        login_password = (password or "").strip()
+        if login_password:
+            self.result.password = login_password
+        else:
+            login_password, pw_is_real = self._resolve_login_password(email)
+            if pw_is_real:
+                self.result.password = login_password
+            else:
+                logger.info("协议登录：调用方没给密码、库里也没有，用默认规则猜一个试试")
+
+        csrf_token = self.get_csrf_token()
+        auth_url = self.get_auth_url(csrf_token, email=email)
+        device_id = self.auth_oauth_init(auth_url)
+        sentinel = self.get_sentinel_token(device_id)
+
+        continue_url = ""
+        try:
+            otp_timeout = max(180, int(self._get_env("OTP_TIMEOUT", "180")))
+        except Exception:
+            otp_timeout = 180
+
+        page_type = ""
+        mode = ""
+        prefer_login_screen_first = str(
+            os.getenv("LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT", "1")
+        ).lower() in ("1", "true", "yes", "on")
+
+        if prefer_login_screen_first:
+            try:
+                logger.info("已有账号协议登录：优先走 login screen_hint 探测 password/otp 分支")
+                login_step = self.authorize_continue(
+                    email=email,
+                    sentinel_token=sentinel,
+                    screen_hint="login",
+                    referer="https://auth.openai.com/log-in",
+                    trace_step="authorize_continue_login_protocol",
+                )
+                page_type = (self._extract_page_type(login_step) or "").lower()
+                continue_url = self._normalize_continue_url(
+                    self._extract_continue_url_from_step(login_step)
+                )
+                page = (login_step.get("page") or {}) if isinstance(login_step, dict) else {}
+                payload = (page.get("payload") or {}) if isinstance(page, dict) else {}
+                mode = (payload.get("email_verification_mode", "") or "").lower()
+                self._existing_page_type = page_type
+                self._existing_email_verification_mode = mode
+
+                if page_type == "login_password" or "/log-in/password" in (continue_url or ""):
+                    logger.info("登录分支: login_password -> password/verify")
+                    # 命中已有账号 password 路径：标记之，让 kickoff_otp_delivery 走 resend
+                    # 分支（避免 send_passwordless_otp 把 state 弄坏 → wrong_email_otp_code）
+                    self._is_existing_account = True
+                    login_resp = self.login_password_verify(login_password)
+                    page_type = (self._extract_page_type(login_resp) or "").lower()
+                    continue_url = self._normalize_continue_url(
+                        self._extract_continue_url_from_step(login_resp)
+                    )
+
+                    # mfa-challenge 分支（密码验证后需要 TOTP 2FA）
+                    if self._is_mfa_challenge_state(page_type, continue_url):
+                        totp_secret = (self.result.totp_secret or "").strip()
+                        if not totp_secret and self._account_callback:
+                            # 从数据库加载凭证
+                            try:
+                                cred = self._account_callback(email)
+                                if cred and cred.get("totp_secret"):
+                                    totp_secret = cred["totp_secret"]
+                                    self.result.totp_secret = totp_secret
+                                    logger.info("已从数据库加载 totp_secret")
+                            except Exception as e:
+                                logger.warning(f"account_callback 异常: {e}")
+                        if not totp_secret:
+                            logger.warning("进入 mfa-challenge 但没有 totp_secret，无法继续")
+                        else:
+                            challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
+                            if challenge_id:
+                                totp_code = _totp_now(totp_secret)
+                                logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
+                                mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
+                                page_type = (self._extract_page_type(mfa_resp) or "").lower()
+                                continue_url = self._normalize_continue_url(
+                                    self._extract_continue_url_from_step(mfa_resp)
+                                )
+                            else:
+                                logger.warning("无法从 continue_url 提取 challenge_id")
+
+                elif page_type == "email_otp_verification" or _looks_like_email_verify_url(continue_url or ""):
+                    logger.info("登录分支: email_otp_verification")
+                    # 同上：authorize/continue 已 trigger 发码，kickoff_otp_delivery 必须只 resend。
+                    self._is_existing_account = True
+                else:
+                    logger.info(
+                        "login screen_hint 未直接命中已有账号完成态: page_type=%s continue_url=%s",
+                        page_type or "(empty)",
+                        (continue_url or "")[:180] or "(empty)",
+                    )
+            except Exception as e:
+                logger.warning(f"login screen_hint 探测失败，回退 signup 探测: {e}")
+                continue_url = ""
+                page_type = ""
+                mode = ""
+
+        if not continue_url and page_type not in ("login_password", "email_otp_verification"):
+            is_new = self.signup(email, sentinel)
+            if is_new:
+                logger.warning("目标邮箱未命中已有账号分支，回退到注册链路")
+                self.register_password(email)
+                otp_sent_at = time.time()
+                self.send_otp()
+                otp_code = mail_provider.wait_for_otp(
+                    email,
+                    timeout=otp_timeout,
+                    issued_after=otp_sent_at,
+                )
+                self.verify_otp(otp_code)
+                continue_url = self.create_account()
+            else:
+                page_type = (self._existing_page_type or "").lower()
+                mode = (self._existing_email_verification_mode or "").lower()
+        else:
+            page_type = (page_type or self._existing_page_type or "").lower()
+            mode = (mode or self._existing_email_verification_mode or "").lower()
+
+        if not continue_url or _looks_like_email_verify_url(continue_url):
+            # 仍需 OTP：优先 resend 获取新码
+            otp_sent_at = time.time()
+            resend_ok = self.kickoff_otp_delivery("protocol_need_otp")
+            if not resend_ok and mode not in ("passwordless_signup", "passwordless_login"):
+                otp_sent_at = time.time()
+                self.send_otp()
+
+            otp_code = mail_provider.wait_for_otp(
+                email,
+                timeout=otp_timeout,
+                issued_after=otp_sent_at,
+            )
+            try:
+                otp_resp = self.verify_otp(otp_code)
+                self.fetch_client_auth_session_dump("post_verify_otp_protocol")
+            except RuntimeError as e:
+                if any(code in str(e) for code in ("401", "409")):
+                    logger.warning(f"OTP 首次验证失败，重发重试: {e}")
+                    otp_sent_at = time.time()
+                    if not self.kickoff_otp_delivery("protocol_verify_retry"):
+                        self.send_otp()
+                    otp_code = mail_provider.wait_for_otp(
+                        email,
+                        timeout=otp_timeout,
+                        issued_after=otp_sent_at,
+                    )
+                    otp_resp = self.verify_otp(otp_code)
+                    self.fetch_client_auth_session_dump("post_verify_otp_retry_protocol")
+                else:
+                    raise
+            continue_url = self._extract_continue_url_from_step(otp_resp)
+            continue_url = self._normalize_continue_url(continue_url)
+            if self._is_add_phone_state(page_type=self._extract_page_type(otp_resp), continue_url=continue_url):
+                continue_url = self._normalize_continue_url(
+                    self._handle_add_phone_verification(continue_url=continue_url)
+                )
+
+        continue_url = self._normalize_continue_url(continue_url)
+        # 某些边缘态 OTP 后未返回 callback，回退 reauthorize
+        if not continue_url:
+            continue_url = self._reauthorize_for_session(auth_url, mail_provider=mail_provider) or ""
+
+        refresh_only_mode = self._env_flag("OAUTH_REFRESH_ONLY", "0")
+        callback_url = ""
+        if continue_url:
+            continue_url = self._normalize_continue_url(continue_url)
+            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1"):
+                self.oauth_codex_rt_exchange(mail_provider=mail_provider)
+            pre_exchange_default = "1" if refresh_only_mode else "0"
+            pre_exchange = self._env_flag("OAUTH_EXCHANGE_BEFORE_CALLBACK", pre_exchange_default)
+            if pre_exchange:
+                self.oauth_token_exchange(continue_url, continue_url)
+            callback_url, final_url = self.follow_redirect_chain(continue_url)
+            if (not callback_url) and final_url and ("/workspace" in final_url):
+                normalized = self._normalize_continue_url(final_url)
+                if normalized and normalized != final_url:
+                    callback_url, final_url = self.follow_redirect_chain(normalized)
+
+        if not refresh_only_mode:
+            self.get_auth_session()
+
+        if callback_url or continue_url:
+            self.fetch_client_auth_session_dump("pre_oauth_exchange_protocol")
+            self.oauth_token_exchange(callback_url or "", continue_url or "")
+            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
+                self.oauth_codex_rt_exchange(mail_provider=mail_provider)
+            if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
+                self.oauth_secondary_authorize_exchange()
+            if not refresh_only_mode:
+                self.get_auth_session()
+
+        if refresh_only_mode:
+            if not (self.result.refresh_token or self.result.access_token):
+                raise RuntimeError("协议登录完成，但未拿到 refresh_token/access_token")
+        elif not self.result.is_valid():
+            raise RuntimeError("协议登录完成，但未拿到有效 session/access token")
+
+        logger.info("纯协议登录流程完成")
+        return self.result
+
+    # ── 从已有凭证初始化 ──
+    def from_existing_credentials(
+        self, session_token: str, access_token: str, device_id: str
+    ) -> AuthResult:
+        """使用已有凭证（跳过注册）"""
+        self.result.device_id = device_id or str(uuid.uuid4())
+        self.session.cookies.set("oai-did", self.result.device_id, domain=".chatgpt.com")
+        detected_email = ""
+
+        # 如果有 session_token, 用它刷新 access_token (旧 access_token 可能已过期)
+        if session_token:
+            self.session.cookies.set(
+                "__Secure-next-auth.session-token",
+                session_token,
+                domain=".chatgpt.com",
+            )
+            logger.info("使用 session_token 刷新 access_token...")
+            try:
+                headers = self._common_headers("https://chatgpt.com/")
+                resp = self.session.get(
+                    "https://chatgpt.com/api/auth/session",
+                    headers=headers,
+                    timeout=30,
+                )
+                session_data = resp.json() if resp is not None else {}
+                new_access_token = session_data.get("accessToken", "")
+                user_obj = session_data.get("user", {}) if isinstance(session_data, dict) else {}
+                if isinstance(user_obj, dict):
+                    detected_email = detected_email or (user_obj.get("email", "") or "")
+                new_session_token = self.session.cookies.get("__Secure-next-auth.session-token", "")
+                if new_access_token:
+                    access_token = new_access_token
+                    logger.info("access_token 刷新成功")
+                else:
+                    logger.warning(f"access_token 刷新失败 (status={resp.status_code}), 使用原 token")
+                if new_session_token:
+                    session_token = new_session_token
+            except Exception as e:
+                logger.warning(f"刷新 access_token 失败: {e}, 使用原 token")
+        elif access_token:
+            # 没有 session_token, 尝试通过 access_token 获取
+            logger.info("未提供 session_token, 尝试通过 access_token 获取...")
+            try:
+                headers = self._common_headers("https://chatgpt.com/")
+                headers["Authorization"] = f"Bearer {access_token}"
+                resp = self.session.get(
+                    "https://chatgpt.com/api/auth/session",
+                    headers=headers,
+                    timeout=30,
+                )
+                session_data = resp.json() if resp is not None else {}
+                user_obj = session_data.get("user", {}) if isinstance(session_data, dict) else {}
+                if isinstance(user_obj, dict):
+                    detected_email = detected_email or (user_obj.get("email", "") or "")
+                session_token = self.session.cookies.get("__Secure-next-auth.session-token", "")
+                if session_token:
+                    logger.info("通过 access_token 获取 session_token 成功")
+                else:
+                    logger.warning("未能获取 session_token, 可能需要手动提供")
+            except Exception as e:
+                logger.warning(f"获取 session_token 失败: {e}")
+
+        self.result.access_token = access_token
+        self.result.session_token = session_token
+        if session_token:
+            self.session.cookies.set(
+                "__Secure-next-auth.session-token",
+                session_token,
+                domain=".chatgpt.com",
+            )
+        self.result.cookie_header = self._build_chatgpt_cookie_header()
+
+        # 回填 email（skip-register 模式下常用于账单 email）
+        if not detected_email and access_token and access_token.count(".") >= 2:
+            try:
+                payload_b64 = access_token.split(".")[1]
+                payload_b64 += "=" * (-len(payload_b64) % 4)
+                payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8"))
+                prof = payload.get("https://api.openai.com/profile", {}) if isinstance(payload, dict) else {}
+                if isinstance(prof, dict):
+                    detected_email = detected_email or (prof.get("email", "") or "")
+            except Exception:
+                pass
+        self.result.email = detected_email or ""
+        logger.info("使用已有凭证初始化完成")
+        return self.result

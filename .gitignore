@@ -1,0 +1,126 @@
+# ──────────────── 敏感数据（绝对不能提交！）────────────────
+# 注册后的账号凭证 / 接码号池 / OTP 日志
+webui/webui.db
+webui/webui.db-shm
+webui/webui.db-wal
+webui/webui.db-journal
+webui/logs/
+# ⚠️ 2026-08-04 补：手动备份的 *.db.bak 之前没被拦住，
+#    `git add .` 会把整个号池（含已注册凭证）传上 GitHub。
+*.db.bak
+*.db.backup
+*.sqlite
+*.sqlite3
+run.log
+run*.log
+account_*.json
+*.session
+*.token
+
+# Outlook 4 段格式接码号（如果主人手动放过）
+mail.txt
+accounts.txt
+outlook_accounts.txt
+
+# ──────────────── Python ────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+.venv/
+.vendor/
+venv/
+env/
+ENV/
+
+# ──────────────── 测试 / 临时 ────────────────
+/tmp/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ──────────────── IDE ────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ──────────────── OS ────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ──────────────── Camoufox / Playwright 缓存（如果主人保留浏览器路径残留）────────────────
+.camoufox/
+.playwright/
+chatgpt_reg_*
+
+# ──────────────── 节点（QuickJS sentinel SDK 缓存）────────────────
+node_modules/
+openai-sentinel-demo/
+
+# ──────────────── 工作流追踪文件（如果主人启过 AUTH_TRACE_DUMP=1）────────────────
+outputs/
+auth_trace_*.jsonl
+
+# ──────────────── 配置覆盖（用户本地配置不进 repo）────────────────
+config.local.json
+.env
+.env.local
+secrets.json
+
+# ──────────────── 运行数据 / 审计产物（开源前审计 2026-09-29 补充）────────────────
+# ⚠️ 以下文件都是**跑号过程中产生的数据**，含真实邮箱、取件 token、代理凭据、
+#    诊断结论等。开源仓库里绝不能出现 —— 一旦推上去等于把这些全部公开。
+#
+# 邮箱 / 取件链接（token 就在 URL 里）
+emails_to_check.txt
+icloud_import_normalized.txt
+failed_emails_*.txt
+emails_missing_*.txt
+emails_noncompliant_*.txt
+mailboxes*.txt
+relay*.txt
+
+# 探测与诊断结果
+reg_probe_result.json
+reg_probe_result.txt
+trial_done_runs.json
+trial_sweep_*.json
+proxy_findings.txt
+proxy_api_findings.txt
+settings_export.json
+
+# 内部诊断报告（含真实邮箱、出口 IP、失败样本）
+DIAGNOSIS-*.md
+SIMULATION_QC.txt
+SOURCE_MANIFEST.txt
+迁移说明.txt
+功能清单-*.md
+SOURCE_EXPORT_NOTICE.md
+
+# 部署包 / 临时工具目录
+_zipsrc/
+_npm/
+_npm_install.log
+data/
+.zcode/
+.pytest_cache
+
+# 我自己的临时脚本（排查用，带下划线前缀，只可能在仓库根目录）
+# ⚠️ 必须用 `/_` 锚定根目录：写成 `_*.py` 会误伤 mail_providers/__init__.py 等
+#    必需文件；`_*.js` 会误伤前端产物里的 _baseClone-*.js（部署要用）。
+/_*.py
+/_*.txt
+/_*.json
+/_*.log
+/_*.html
+/_*.js
+/_*.png
